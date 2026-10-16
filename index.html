@@ -77,7 +77,16 @@
     </div>
     <div><button id="btnRanking">🏆 ランキングを見る</button></div>
     <p style="font-size:13px">視線データ・カメラ映像はこの PC 内でのみ処理され、外部に送信されません。<br>
-      プレイヤー登録では名前と「両目の間隔」の数値だけをこの PC に保存します。</p>
+      プレイヤー登録では名前と「両目の間隔」の数値だけをこの PC に保存します。<br>
+      <b style="color:var(--fg)">ESC キーでいつでも終了</b>（ゲームのウィンドウとブリッジも閉じます）</p>
+  </div>
+</div>
+
+<!-- 終了中 -->
+<div id="quit" class="overlay hidden" style="z-index:60">
+  <div class="panel">
+    <h1>終了しています…</h1>
+    <p id="quitMsg">後片付けをしています。そのままお待ちください。</p>
   </div>
 </div>
 
@@ -878,6 +887,7 @@
   }
 
   function update(dt) {
+    if (state === 'quit') return;
     updateGazeTarget();
     updateDwell(dt);
     document.body.classList.toggle('playing', state === 'countdown' || state === 'play');
@@ -1007,9 +1017,20 @@
     try { await connectBridge(); } catch { /* ブリッジなし → ゲスト */ }
   }
 
+  // ブリッジが開く専用ウィンドウは最初から画面いっぱい（ブラウザ自体の全画面）なので、ページの全画面にはしない。
+  // ページの全画面だと ESC はブラウザが全画面解除に使ってしまい、ゲームに届かないため
+  const fillsScreen = () => innerWidth >= screen.width - 1 && innerHeight >= screen.height - 1;
+  function enterFullscreen() {
+    if (fillsScreen() || document.fullscreenElement) return Promise.resolve();
+    const p = document.documentElement.requestFullscreen?.();
+    if (!p) return Promise.resolve();
+    // 対応ブラウザ（Chrome/Edge）では ESC をページで受け取れるようにする（全画面解除は ESC 長押し）
+    return p.then(() => navigator.keyboard?.lock?.(['Escape'])).catch(() => {});
+  }
+
   $('btnTobii').addEventListener('click', async () => {
     // 全画面要求はクリック直後（ユーザー操作中）に出す必要がある
-    const fs = document.documentElement.requestFullscreen?.().catch(() => {});
+    const fs = enterFullscreen();
     hide('title');
     inputMode = 'tobii';
     try {
@@ -1091,6 +1112,32 @@
     show('title'); state = 'title';
   });
   addEventListener('keydown', e => { if (e.code === 'Space' && state === 'over') { e.preventDefault(); reset(); } });
+
+  // ---------- ESC で終了 ----------
+  // 後片付け（Webカメラ停止・全画面解除）をしてからブリッジに終了を依頼する。
+  // ブリッジはキャリブレーション中止・Tobii の受信停止・ポート解放・専用ウィンドウを閉じる処理をして終わる
+  addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); quitGame(); } });
+
+  let quitting = false;
+  async function quitGame() {
+    if (quitting) return;
+    quitting = true;
+    state = 'quit';
+    document.querySelectorAll('.overlay').forEach(el => el.classList.add('hidden'));
+    hide('hud'); show('quit');
+    try { if (window.webgazer && inputMode === 'gaze') webgazer.end(); } catch { /* 未開始なら何もしない */ }
+    if (bridgeOK()) {
+      try {
+        await Promise.race([wsRequest({ type: 'shutdown' }, 'bye'), wait(3000)]);
+      } catch { /* 応答がなくても続ける */ }
+    }
+    try { if (document.fullscreenElement) await document.exitFullscreen(); } catch {}
+    // 専用ウィンドウならブリッジが閉じる。スクリプトで開いたウィンドウでなければ close() は無視される
+    window.close();
+    await wait(1500);
+    $('quit').querySelector('h1').textContent = '終了しました';
+    $('quitMsg').textContent = bridgeInfo || ws ? 'ブリッジも終了しました。このタブを閉じてください。' : 'このタブを閉じてください。';
+  }
 
   // 動作確認用：?debug を付けて開くと、コンソールから gazeDebug() で内部の状態を見られる
   if (new URLSearchParams(location.search).has('debug')) {

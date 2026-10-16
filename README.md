@@ -13,8 +13,9 @@ Tobii Pro ──(tobii_research)──> tobii_bridge.py ──(WebSocket)──>
 ```
 
 1. Tobii を接続し、Tobii Pro Eye Tracker Manager で認識・Display setup ができていることを確認
-2. `run_tobii.bat` をダブルクリック（または `python -X utf8 tobii_bridge.py`）
-3. ブラウザで http://localhost:8000 を開き「Tobii で始める」
+2. `run_tobii.bat` をダブルクリック。準備ができると**ゲーム専用ウィンドウ（全画面）**が自動で開く
+   （Chrome、なければ Edge。普段使いのブラウザとは別のプロファイル `%LOCALAPPDATA%\GazeDodge` を使う）
+3. 「Tobii で始める」
 4. 全画面になるので「キャリブレーション開始」→ 5 つの赤い点を順に見つめる（点が縮みきるまで）
    - 「スキップ」すると Eye Tracker Manager 等で済ませた現在の校正をそのまま使う
 5. 続けて 4 つの緑の点を見つめる（精度の検証）。点ごとに実際の注視点と点のずれを測り、
@@ -23,6 +24,13 @@ Tobii Pro ──(tobii_research)──> tobii_bridge.py ──(WebSocket)──>
    - 40 px は、この PC の実験環境（幅 51.2 cm・距離 61 cm・1920 px）で約 1°。`Tobii_pro/config.py` の `CALIBRATION_MAX_OFFSET_DEG = 1.0` と同じ目安
    - 全画面でないと画面の位置を概算するため、ずれが大きく出ます
 6. プレイヤーを選ぶ（下記）→ ゲーム開始
+
+終了するとき:
+- **ゲーム中いつでも ESC** を押すと、ゲームが後片付け（Webカメラ停止・全画面解除）をしてブリッジに終了を依頼し、
+  ブリッジがキャリブレーションの中止・Tobii の受信停止・ポートの解放・ゲーム専用ウィンドウを閉じる処理をして終了します。
+  `run_tobii.bat` の黒い画面も一緒に閉じます（エラーで止まったときだけ、メッセージを読めるよう残ります）
+- ゲーム専用ウィンドウを Alt+F4 などで閉じた場合や、黒い画面で Ctrl+C を押した場合も、同じ後片付けをして終了します
+- 専用ウィンドウの見張りに `psutil` を使います（このPCには導入済み）
 
 遅延について:
 - ブリッジは Tobii のサンプルが届くたびにすぐ送ります（Pro Fusion は 120 Hz、8.3 ms ごと）
@@ -36,7 +44,7 @@ Tobii Pro ──(tobii_research)──> tobii_bridge.py ──(WebSocket)──>
   目が開いてから 0.12 秒間のサンプルは捨てます。
   モックで再現したところ、プレイヤーが下にずれる量と時間は「約 200 px・0.37 秒」から「約 110 px・0.06 秒」に減りました
   （実機は 120 Hz でモックより早く瞬きを検出できるので、さらに短くなる見込み）
-- 必要パッケージ: `tobii-research`, `websockets`（このPCには導入済み）
+- 必要パッケージ: `tobii-research`, `websockets`, `psutil`（このPCには導入済み）
 
 ### 実機なしで試す
 

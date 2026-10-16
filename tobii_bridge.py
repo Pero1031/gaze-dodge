@@ -8,6 +8,11 @@ Tobii Pro アイトラッカーの視線データをブラウザのゲーム(ind
 実行:
     python -X utf8 tobii_bridge.py           # Tobii 実機
     python -X utf8 tobii_bridge.py --mock    # 実機なし（マウスカーソル位置を視線として送る）
+    python -X utf8 tobii_bridge.py --open    # 準備ができたらゲーム専用ウィンドウ（全画面）を開く
+
+終了:
+    ゲームで ESC を押すと、ブラウザが shutdown を送り、ブリッジはキャリブレーション中止・Tobii の受信停止・
+    ポートの解放・専用ウィンドウを閉じる処理をしてから終了する。専用ウィンドウが閉じられた場合や Ctrl+C でも同じ。
 
 座標は Tobii の display area 基準の正規化座標(0-1)。display area は
 Tobii Pro Eye Tracker Manager の「Display setup」で設定したモニター全体なので、
@@ -33,6 +38,7 @@ WebSocket プロトコル (JSON):
     {"type":"player_add", "name":str, "ipd":mm or null}   -> players
     {"type":"player_delete", "id":str}                    -> players
     {"type":"score_add", "id":str, "score":int, "seconds":float} -> score_saved
+    {"type":"shutdown"}                         -> bye を返してからブリッジを終了する
 
 プレイヤーとスコアは data/players.json に保存する（名前と両目の間隔の数値のみ。画像は扱わない）。
 """
@@ -43,8 +49,10 @@ import functools
 import http.server
 import json
 import math
+import os
 import random
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -321,6 +329,100 @@ def disable_console_quick_edit():
         k32.SetConsoleMode(h, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
 
 
+# ---------------------------------------------------------------------------
+# ゲーム専用ウィンドウ
+# ---------------------------------------------------------------------------
+# 普段使いのブラウザのタブはページから閉じられないので、専用のプロファイルでアプリ用ウィンドウを開き、
+# 終了時にブリッジが閉じる。ブラウザ自体の全画面（--start-fullscreen）にしておくと、
+# ESC がページに届く（ページの全画面 API だと ESC はブラウザが全画面解除に使ってしまう）。
+_PF, _PF86, _LAD = (os.environ.get(k, "") for k in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"))
+BROWSER_CANDIDATES = [   # 上から順に探す（Chrome → Edge）
+    Path(_PF) / "Google/Chrome/Application/chrome.exe",
+    Path(_PF86) / "Google/Chrome/Application/chrome.exe",
+    Path(_LAD) / "Google/Chrome/Application/chrome.exe",
+    Path(_PF86) / "Microsoft/Edge/Application/msedge.exe",
+    Path(_PF) / "Microsoft/Edge/Application/msedge.exe",
+]
+BROWSER_PROFILE = Path(_LAD or HERE) / "GazeDodge" / "browser_profile"
+
+
+class GameWindow:
+    """専用プロファイルのブラウザ（= ゲーム専用ウィンドウ）を開き、閉じる。
+    Chrome は起動直後に自分を別プロセスとして立ち上げ直すことがあるので、起動したプロセスの PID ではなく
+    「専用プロファイルを使っているブラウザのプロセス」を psutil で探して見張る。
+    全プロセスのコマンドラインを読むのは遅い（約 0.6 秒）ので、見つけたメインのプロセスを覚えておき、
+    ふだんはその生存確認だけをする。どの処理も時間がかかりうるので、イベントループではなく別スレッドで呼ぶこと。"""
+
+    BROWSER_NAMES = {"chrome.exe", "msedge.exe"}
+
+    def __init__(self, url):
+        exe = next((p for p in BROWSER_CANDIDATES if p.is_file()), None)
+        self.managed = False
+        self.main = None        # 見つけたメインのブラウザプロセス（psutil.Process）
+        self.seen = False       # 一度でも動いているのを確認したか
+        self.missing = 0        # 続けて見つからなかった回数
+        if exe is None:
+            webbrowser.open(url)
+            print("Chrome / Edge が見つからないため、既定のブラウザで開きました（終了時にブラウザは自動で閉じません）")
+            return
+        subprocess.Popen([
+            str(exe), f"--app={url}", f"--user-data-dir={BROWSER_PROFILE}", "--start-fullscreen",
+            "--no-first-run", "--no-default-browser-check", "--disable-session-crashed-bubble",
+        ])
+        self.managed = True
+        print(f"ゲーム専用ウィンドウを開きました（{exe.stem}）")
+
+    @classmethod
+    def _procs(cls, main_only):
+        """専用プロファイルを使っているブラウザのプロセス（main_only なら子プロセス --type=... を除く）。
+        名前で Chrome / Edge に絞ってからコマンドラインを読む（全プロセスを読むと遅い）。"""
+        import psutil
+        key = f"--user-data-dir={BROWSER_PROFILE}"
+        found = []
+        for p in psutil.process_iter(["name"]):
+            if (p.info["name"] or "").lower() not in cls.BROWSER_NAMES:
+                continue
+            try:
+                cmd = p.cmdline()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if key in cmd and not (main_only and any(a.startswith("--type=") for a in cmd)):
+                found.append(p)
+        return found
+
+    def is_closed(self):
+        """1 秒ごとに（別スレッドから）呼ぶ。一度動いているのを見たあと、2 回続けて見つからなければ「閉じられた」とみなす。"""
+        if not self.managed:
+            return False
+        if self.main is not None and self.main.is_running():   # ふだんはこれだけ（一瞬で終わる）
+            return False
+        mains = self._procs(main_only=True)                     # まだ見つけていない／いなくなったときだけ探す
+        if mains:
+            self.main, self.seen, self.missing = mains[0], True, 0
+            return False
+        self.main = None
+        self.missing += 1
+        return self.seen and self.missing >= 2
+
+    def close(self):
+        """まず普通に閉じる（ウィンドウに閉じる指示）→ 5 秒たっても残っていれば強制終了。"""
+        if not self.managed:
+            return
+        import psutil
+        mains = self._procs(main_only=True)
+        if not mains and not self._procs(main_only=False):
+            return
+        for p in mains:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T"], capture_output=True)
+        _, alive = psutil.wait_procs(self._procs(main_only=False), timeout=5)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+        print("ゲーム専用ウィンドウを閉じました" + ("（強制終了あり）" if alive else ""))
+
+
 def start_http(port):
     handler = functools.partial(QuietHandler, directory=str(HERE))
     try:
@@ -340,6 +442,7 @@ async def main(args):
     clients = set()
     loop = asyncio.get_running_loop()
     calib_lock = asyncio.Lock()
+    stop = asyncio.Event()      # セットされたら終了処理へ
 
     async def handler(ws):
         clients.add(ws)
@@ -350,6 +453,11 @@ async def main(args):
             async for raw in ws:
                 msg = json.loads(raw)
                 t = msg.get("type")
+                if t == "shutdown":     # キャリブレーション中でも待たずに受け付ける
+                    print("ゲームから終了の依頼を受けました")
+                    await ws.send(json.dumps({"type": "bye"}))
+                    stop.set()
+                    continue
                 try:
                     async with calib_lock:
                         if t == "calib_start":
@@ -401,17 +509,42 @@ async def main(args):
     except OSError:
         httpd.shutdown()
         raise RuntimeError(PORT_IN_USE_MSG.format(port=args.ws_port, opt="--ws-port 8766、ゲームは http://localhost:8000/?ws=8766 で開く"))
-    async with server:
-        src.listener = on_sample
-        src.start()
-        url = f"http://localhost:{args.http_port}" + (f"/?ws={args.ws_port}" if args.ws_port != 8765 else "")
-        print(f"ゲーム: {url}  （Ctrl+C で終了）")
-        if args.open:   # サーバーの準備ができてからブラウザを開く
-            webbrowser.open(url)
-        try:
-            await asyncio.Future()      # Ctrl+C まで待つ
-        finally:
-            src.stop()
+    window = None
+    try:
+        async with server:
+            src.listener = on_sample
+            src.start()
+            url = f"http://localhost:{args.http_port}" + (f"/?ws={args.ws_port}" if args.ws_port != 8765 else "")
+            print(f"ゲーム: {url}  （ゲームで ESC、または Ctrl+C で終了）")
+            if args.open:   # サーバーの準備ができてからゲーム専用ウィンドウを開く
+                window = GameWindow(url)
+
+            async def watch_window():   # 専用ウィンドウが閉じられたらブリッジも終わる
+                while not stop.is_set():
+                    # 別スレッドで調べる（イベントループで調べると、その間は視線の送信が止まってしまう）
+                    if window is not None and await loop.run_in_executor(None, window.is_closed):
+                        print("ゲーム専用ウィンドウが閉じられました")
+                        stop.set()
+                    await asyncio.sleep(1)
+
+            watcher = asyncio.create_task(watch_window())
+            await stop.wait()
+            watcher.cancel()
+            print("終了処理中…")
+            # ここで async with を抜けると、WebSocket の接続を閉じてポートを解放する
+    finally:
+        # Ctrl+C のときもここを通る。どれかが失敗しても残りは必ず行う
+        src.listener = None
+        for name, step in (("キャリブレーションの中止", src.calib_abort), ("視線データの受信停止", src.stop),
+                           ("ゲーム専用ウィンドウを閉じる", window.close if window else None),
+                           ("HTTP サーバーの停止", httpd.shutdown)):
+            if step is None:
+                continue
+            try:
+                step()
+            except Exception as e:
+                print(f"  {name}に失敗: {e}")
+        print("終了しました")
 
 
 if __name__ == "__main__":
