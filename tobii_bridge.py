@@ -19,12 +19,22 @@ WebSocket プロトコル (JSON):
     {"type":"gaze", "x":0-1, "y":0-1, "valid":bool}
     {"type":"calib_point_done", "ok":bool}
     {"type":"calib_result", "ok":bool, "points":int, "error":正規化距離の平均 or null}
+    {"type":"ipd_result", "ipd":mm or null, "n":サンプル数}
+    {"type":"players", "players":[{id, name, ipd, best, plays}]}  # best の降順
+    {"type":"score_saved", "best":int, "is_best":bool, "rank":int, "players":[...]}
     {"type":"error", "message":str}
   client -> server
     {"type":"calib_start"}
     {"type":"calib_point", "x":0-1, "y":0-1}
     {"type":"calib_compute"}
     {"type":"calib_abort"}
+    {"type":"ipd_measure", "seconds":float}      # 両目の間隔(瞳孔間距離)を測る
+    {"type":"players_get"}
+    {"type":"player_add", "name":str, "ipd":mm or null}   -> players
+    {"type":"player_delete", "id":str}                    -> players
+    {"type":"score_add", "id":str, "score":int, "seconds":float} -> score_saved
+
+プレイヤーとスコアは data/players.json に保存する（名前と両目の間隔の数値のみ。画像は扱わない）。
 """
 
 import argparse
@@ -33,21 +43,49 @@ import functools
 import http.server
 import json
 import math
+import random
+import statistics
 import sys
 import threading
 import time
+import uuid
+import webbrowser
+from collections import deque
 from pathlib import Path
 
 from websockets.asyncio.server import broadcast, serve
 
 HERE = Path(__file__).resolve().parent
-SEND_HZ = 120          # ブラウザへ送る最大レート（トラッカーの周波数がこれ以下ならその周波数）
+DATA_FILE = HERE / "data" / "players.json"
 
 
 # ---------------------------------------------------------------------------
 # 視線ソース
 # ---------------------------------------------------------------------------
-class TobiiSource:
+class SourceBase:
+    """視線ソース共通部分。
+    - 新しいサンプルが来たら listener を呼ぶ（ブリッジがすぐブラウザへ送る。ポーリングによる待ちをなくす）
+    - 両目の間隔（瞳孔間距離, mm）の直近サンプルを溜めて、測定時に中央値を返す
+    """
+    listener = None     # サンプル到着時に（SDK/ポーリングのスレッドから）呼ばれる
+
+    def _notify(self):
+        self.seq += 1
+        if self.listener is not None:
+            self.listener()
+
+    def _init_ipd(self):
+        self.ipd_samples = deque(maxlen=2000)
+
+    def measure_ipd(self, seconds):
+        # blocking。executor から呼ぶ
+        self.ipd_samples.clear()
+        time.sleep(seconds)
+        vals = list(self.ipd_samples)
+        return {"ipd": round(statistics.median(vals), 2) if len(vals) >= 10 else None, "n": len(vals)}
+
+
+class TobiiSource(SourceBase):
     mode = "tobii"
 
     def __init__(self, timeout_sec=10):
@@ -71,6 +109,7 @@ class TobiiSource:
         self.latest = None     # (x, y, valid)
         self.seq = 0
         self.calib = None
+        self._init_ipd()
 
     def start(self):
         self.et.subscribe_to(self.tr.EYETRACKER_GAZE_DATA, self._on_gaze, as_dictionary=True)
@@ -92,7 +131,11 @@ class TobiiSource:
             self.latest = (self.latest[0], self.latest[1], False)
         else:
             self.latest = (0.5, 0.5, False)
-        self.seq += 1
+        # 両目の 3 次元位置(gaze origin, mm)の距離 = 両目の間隔。キャリブレーションに依存しない
+        if g["left_gaze_origin_validity"] == 1 and g["right_gaze_origin_validity"] == 1:
+            self.ipd_samples.append(math.dist(g["left_gaze_origin_in_user_coordinate_system"],
+                                              g["right_gaze_origin_in_user_coordinate_system"]))
+        self._notify()
 
     # --- キャリブレーション（blocking。executor から呼ぶ） ---
     def calib_start(self):
@@ -129,13 +172,18 @@ class TobiiSource:
             self.calib = None
 
 
-class MockSource:
-    """実機なしの動作確認用。プライマリモニター上のマウスカーソル位置を視線とみなす。"""
+class MockSource(SourceBase):
+    """実機なしの動作確認用。プライマリモニター上のマウスカーソル位置を視線とみなす。
+    両目の間隔は ipd(mm) にノイズを加えた値を返す（--mock-ipd で別人を模擬できる）。"""
     mode = "mock"
     model = "mock (mouse cursor)"
     freq = 60.0
 
-    def __init__(self):
+    # --mock-blink のときの瞬きの再現（実機で見られる形）：
+    # 目が閉じ始めると視線が下にずれ（BLINK_DRIFT_PX まで）、閉じている間は無効、開いた直後もしばらく下にずれる
+    BLINK_PERIOD, BLINK_PRE, BLINK_CLOSED, BLINK_POST, BLINK_DRIFT_PX = 3.0, 0.05, 0.20, 0.08, 250
+
+    def __init__(self, ipd=63.0, blink=False, pos=None):
         import ctypes
         import ctypes.wintypes
         self.ctypes = ctypes
@@ -144,9 +192,27 @@ class MockSource:
         self.latest = None
         self.seq = 0
         self._stop = threading.Event()
+        self.ipd = ipd
+        self.blink = blink
+        self.pos = pos          # (x, y) 0-1 を指定するとカーソルの代わりにその位置を見続ける
+        self._init_ipd()
 
     def start(self):
         threading.Thread(target=self._poll, daemon=True).start()
+
+    def _blink_offset(self, now):
+        """(下へのずれ px, 有効か)。瞬きは BLINK_PERIOD 秒ごと。"""
+        if not self.blink:
+            return 0.0, True
+        ph = now % self.BLINK_PERIOD
+        pre, closed, post = self.BLINK_PRE, self.BLINK_CLOSED, self.BLINK_POST
+        if ph < pre:
+            return self.BLINK_DRIFT_PX * ph / pre, True
+        if ph < pre + closed:
+            return 0.0, False
+        if ph < pre + closed + post:
+            return self.BLINK_DRIFT_PX * (1 - (ph - pre - closed) / post), True
+        return 0.0, True
 
     def stop(self):
         self._stop.set()
@@ -155,15 +221,73 @@ class MockSource:
         pt = self.ctypes.wintypes.POINT()
         sw, sh = self.user32.GetSystemMetrics(0), self.user32.GetSystemMetrics(1)
         while not self._stop.is_set():
-            self.user32.GetCursorPos(self.ctypes.byref(pt))
-            self.latest = (pt.x / sw, pt.y / sh, True)
-            self.seq += 1
+            if self.pos:
+                pt.x, pt.y = int(self.pos[0] * sw), int(self.pos[1] * sh)
+            else:
+                self.user32.GetCursorPos(self.ctypes.byref(pt))
+            drift, valid = self._blink_offset(time.time())
+            self.latest = (pt.x / sw, (pt.y + drift) / sh, valid)
+            self.ipd_samples.append(random.gauss(self.ipd, 0.3))
+            self._notify()
             time.sleep(1 / self.freq)
 
     def calib_start(self): pass
     def calib_point(self, x, y): time.sleep(0.5); return True
     def calib_compute(self): return {"ok": True, "points": 5, "error": 0.0}
     def calib_abort(self): pass
+
+
+# ---------------------------------------------------------------------------
+# プレイヤー・スコア保存
+# ---------------------------------------------------------------------------
+class PlayerStore:
+    def __init__(self, path):
+        self.path = path
+        if path.exists():
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            self.data = {"players": [], "scores": []}
+
+    def _save(self):
+        self.path.parent.mkdir(exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def players(self):
+        """ベストスコアの降順（同点・未プレイは登録順）。"""
+        out = []
+        for p in self.data["players"]:
+            scores = [s["score"] for s in self.data["scores"] if s["player_id"] == p["id"]]
+            out.append({"id": p["id"], "name": p["name"], "ipd": p.get("ipd"),
+                        "best": max(scores, default=0), "plays": len(scores)})
+        return sorted(out, key=lambda p: -p["best"])
+
+    def add(self, name, ipd):
+        name = str(name).strip()[:20]
+        if not name:
+            raise ValueError("名前が空です")
+        if any(p["name"] == name for p in self.data["players"]):
+            raise ValueError(f"「{name}」はすでに登録されています")
+        self.data["players"].append({"id": uuid.uuid4().hex[:8], "name": name, "ipd": ipd,
+                                     "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+        self._save()
+
+    def delete(self, pid):
+        self.data["players"] = [p for p in self.data["players"] if p["id"] != pid]
+        self.data["scores"] = [s for s in self.data["scores"] if s["player_id"] != pid]
+        self._save()
+
+    def add_score(self, pid, score, seconds):
+        if not any(p["id"] == pid for p in self.data["players"]):
+            raise ValueError("プレイヤーが見つかりません")
+        prev = max((s["score"] for s in self.data["scores"] if s["player_id"] == pid), default=0)
+        self.data["scores"].append({"player_id": pid, "score": int(score), "seconds": round(float(seconds), 2),
+                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+        self._save()
+        players = self.players()
+        rank = next(i for i, p in enumerate(players, 1) if p["id"] == pid)
+        return {"best": max(prev, int(score)), "is_best": int(score) > prev, "rank": rank, "players": players}
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +307,20 @@ PORT_IN_USE_MSG = ("ポート {port} は使用中です。tobii_bridge.py がす
                    "そちらを Ctrl+C で止めてから起動してください。（別ポートで起動する場合は {opt}）")
 
 
+def disable_console_quick_edit():
+    """Windows のコンソールで「簡易編集モード」を切る。
+    有効なままだとウィンドウ内をクリックしただけで出力(print)が止まり、ブリッジ全体が固まる。"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.GetStdHandle(-10)               # STD_INPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if k32.GetConsoleMode(h, ctypes.byref(mode)):   # コンソールでなければ何もしない
+        ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+        k32.SetConsoleMode(h, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+
+
 def start_http(port):
     handler = functools.partial(QuietHandler, directory=str(HERE))
     try:
@@ -194,7 +332,9 @@ def start_http(port):
 
 
 async def main(args):
-    src = MockSource() if args.mock else TobiiSource()
+    mock_pos = tuple(float(v) for v in args.mock_pos.split(",")) if args.mock_pos else None
+    src = MockSource(args.mock_ipd, args.mock_blink, mock_pos) if args.mock else TobiiSource()
+    store = PlayerStore(Path(args.data))
     print(f"視線ソース: {src.mode} / {src.model} / {src.freq} Hz")
 
     clients = set()
@@ -223,6 +363,18 @@ async def main(args):
                             await ws.send(json.dumps({"type": "calib_result", **res}))
                         elif t == "calib_abort":
                             await loop.run_in_executor(None, src.calib_abort)
+                        elif t == "ipd_measure":
+                            res = await loop.run_in_executor(None, src.measure_ipd, float(msg.get("seconds", 2)))
+                            await ws.send(json.dumps({"type": "ipd_result", **res}))
+                        elif t in ("players_get", "player_add", "player_delete"):
+                            if t == "player_add":
+                                store.add(msg["name"], msg.get("ipd"))
+                            elif t == "player_delete":
+                                store.delete(msg["id"])
+                            await ws.send(json.dumps({"type": "players", "players": store.players()}))
+                        elif t == "score_add":
+                            res = store.add_score(msg["id"], msg["score"], msg["seconds"])
+                            await ws.send(json.dumps({"type": "score_saved", **res}))
                 except Exception as e:  # SDK エラーはブラウザに伝えて継続
                     print(f"エラー: {e}")
                     await ws.send(json.dumps({"type": "error", "message": str(e)}))
@@ -230,15 +382,18 @@ async def main(args):
             clients.discard(ws)
             print(f"ブラウザ切断 ({len(clients)})")
 
-    async def pump():
-        last = -1
-        interval = 1 / min(SEND_HZ, src.freq or SEND_HZ)
-        while True:
-            if src.seq != last and src.latest and clients:
-                last = src.seq
-                x, y, valid = src.latest
-                broadcast(clients, json.dumps({"type": "gaze", "x": x, "y": y, "valid": valid}))
-            await asyncio.sleep(interval)
+    # サンプルが届いたらすぐ送る（以前は一定間隔のポーリングで、平均 5 ms ほど余計に待っていた）。
+    # SDK のスレッドから呼ばれるので、送信はイベントループに渡す
+    def push():
+        if clients and src.latest:
+            x, y, valid = src.latest
+            broadcast(clients, json.dumps({"type": "gaze", "x": x, "y": y, "valid": valid}))
+
+    def on_sample():
+        try:
+            loop.call_soon_threadsafe(push)
+        except RuntimeError:    # 終了処理中でループが閉じている
+            pass
 
     httpd = start_http(args.http_port)
     try:
@@ -247,10 +402,14 @@ async def main(args):
         httpd.shutdown()
         raise RuntimeError(PORT_IN_USE_MSG.format(port=args.ws_port, opt="--ws-port 8766、ゲームは http://localhost:8000/?ws=8766 で開く"))
     async with server:
+        src.listener = on_sample
         src.start()
-        print(f"ゲーム: http://localhost:{args.http_port}  （Ctrl+C で終了）")
+        url = f"http://localhost:{args.http_port}" + (f"/?ws={args.ws_port}" if args.ws_port != 8765 else "")
+        print(f"ゲーム: {url}  （Ctrl+C で終了）")
+        if args.open:   # サーバーの準備ができてからブラウザを開く
+            webbrowser.open(url)
         try:
-            await pump()
+            await asyncio.Future()      # Ctrl+C まで待つ
         finally:
             src.stop()
 
@@ -258,8 +417,14 @@ async def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true", help="実機なしでマウスカーソルを視線として送る")
+    ap.add_argument("--mock-ipd", type=float, default=63.0, help="--mock 時の両目の間隔 [mm]（別人を模擬）")
+    ap.add_argument("--mock-blink", action="store_true", help="--mock 時に 3 秒ごとの瞬き（直前直後に視線が下にずれる）を再現")
+    ap.add_argument("--mock-pos", help="--mock 時にカーソルの代わりに見続ける位置（画面全体を 0-1 として 'x,y'）")
     ap.add_argument("--http-port", type=int, default=8000)
     ap.add_argument("--ws-port", type=int, default=8765)
+    ap.add_argument("--open", action="store_true", help="起動完了後にブラウザでゲームを開く")
+    ap.add_argument("--data", default=str(DATA_FILE), help="プレイヤー・スコアの保存先（テスト用に切り替える場合）")
+    disable_console_quick_edit()
     try:
         asyncio.run(main(ap.parse_args()))
     except KeyboardInterrupt:

@@ -1,5 +1,5 @@
 @echo off
 cd /d %~dp0
-start "" http://localhost:8000
-python -X utf8 tobii_bridge.py %*
+rem --open: the bridge opens the browser after it is ready
+python -X utf8 tobii_bridge.py --open %*
 pause

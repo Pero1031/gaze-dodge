@@ -5,21 +5,45 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Gaze Dodge</title>
 <style>
-  :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --danger:#ff6b6b; --ok:#3fb950; }
+  :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --danger:#ff6b6b; --ok:#3fb950; --gold:#e3b341; }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
     font-family: system-ui, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; overflow:hidden; }
   canvas { position:fixed; inset:0; display:block; }
   .overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:10; }
   .panel { background:rgba(22,27,34,.95); border:1px solid #30363d; border-radius:12px; padding:28px 32px;
-    max-width:560px; width:calc(100% - 32px); text-align:center; }
+    max-width:560px; width:calc(100% - 32px); text-align:center; max-height:calc(100% - 32px); overflow:auto; }
+  .panel.wide { max-width:820px; }
   .panel h1 { margin:0 0 8px; font-size:28px; }
   .panel p { color:var(--muted); line-height:1.7; margin:8px 0; }
   button { font:inherit; font-size:16px; padding:10px 20px; margin:6px; border-radius:8px; border:1px solid #30363d;
     background:#21262d; color:var(--fg); cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#0d1117; font-weight:600; }
+  button.danger { border-color:var(--danger); color:var(--danger); }
   button:hover { filter:brightness(1.15); }
+  /* 視線で見つめて選べるボタン。見つめている間、下端のバーが伸びる */
+  button.dwell { position:relative; overflow:hidden; }
+  button.dwell::after { content:''; position:absolute; left:0; bottom:0; height:5px;
+    width:calc(var(--p, 0) * 100%); background:var(--ok); }
+  #gazeCursor { position:fixed; width:26px; height:26px; margin:-13px 0 0 -13px; border-radius:50%;
+    border:2px solid rgba(255,255,255,.7); box-shadow:0 0 6px #000; z-index:50; pointer-events:none; }
+  input[type=text] { font:inherit; font-size:22px; padding:10px 14px; width:min(320px, 100%); border-radius:8px;
+    border:1px solid #30363d; background:#0d1117; color:var(--fg); text-align:center; }
+  .plist { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:12px; margin:18px 0; }
+  .plist button { margin:0; padding:20px 10px; font-size:22px; line-height:1.3; }
+  .plist button small { display:block; font-size:13px; font-weight:400; opacity:.75; }
+  .plist button .tag { position:absolute; top:4px; right:8px; font-size:11px; font-weight:700; }
+  table.rank { margin:12px auto; border-collapse:collapse; min-width:280px; }
+  table.rank td { padding:4px 12px; text-align:left; }
+  table.rank td:first-child { color:var(--muted); text-align:right; }
+  table.rank td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  table.rank tr.me td { color:var(--gold); font-weight:700; }
+  table.rank th { padding:4px 12px; font-size:13px; font-weight:400; color:var(--muted); border-bottom:1px solid #30363d; }
+  #rankingTable tbody tr:nth-child(1) td:nth-child(2) { color:var(--gold); font-weight:700; }
+  #rankingTable td:nth-child(4) { color:var(--muted); font-size:14px; }
   .hidden { display:none !important; }
+  /* カウントダウン中・プレイ中はマウスカーソルを消す（視線のじゃまにならないように） */
+  body.playing, body.playing * { cursor:none !important; }
   #hud { position:fixed; top:12px; left:16px; z-index:5; font-size:18px; pointer-events:none; text-shadow:0 1px 3px #000; }
   #hud span { margin-right:18px; }
   #status { position:fixed; bottom:10px; left:16px; z-index:5; font-size:13px; color:var(--muted); pointer-events:none; }
@@ -28,14 +52,15 @@
   .calib-pt.done { background:var(--ok); pointer-events:none; opacity:.5; }
   #calibMsg { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:15; text-align:center;
     color:var(--muted); pointer-events:none; line-height:1.7; }
-  /* WebGazer のカメラ映像を左上に小さく */
+  /* WebGazer のカメラ映像を左下に小さく */
   #webgazerVideoContainer { top:auto !important; bottom:40px !important; left:16px !important; opacity:.8; z-index:30 !important; }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
+<div id="gazeCursor" class="hidden"></div>
 
-<div id="hud" class="hidden"><span id="score">スコア: 0</span><span id="best">ベスト: 0</span><span id="mode"></span></div>
+<div id="hud" class="hidden"><span id="who"></span><span id="score">スコア: 0</span><span id="best">ベスト: 0</span><span id="mode"></span></div>
 <div id="status"></div>
 
 <!-- タイトル -->
@@ -50,11 +75,13 @@
       <button id="btnGaze">Webカメラで始める</button>
       <button id="btnMouse">マウス（テスト用）</button>
     </div>
-    <p style="font-size:13px">カメラ映像・視線データはこの PC 内でのみ処理され、外部に送信されません。</p>
+    <div><button id="btnRanking">🏆 ランキングを見る</button></div>
+    <p style="font-size:13px">視線データ・カメラ映像はこの PC 内でのみ処理され、外部に送信されません。<br>
+      プレイヤー登録では名前と「両目の間隔」の数値だけをこの PC に保存します。</p>
   </div>
 </div>
 
-<!-- 校正 -->
+<!-- Webカメラ校正 -->
 <div id="calibMsg" class="hidden">
   <b style="color:var(--fg);font-size:20px">校正</b><br>
   各点を<b>見つめながら</b> 5 回クリックしてください（緑になれば完了）。<br>
@@ -70,17 +97,67 @@
   </div>
 </div>
 
+<!-- プレイヤー選択 -->
+<div id="select" class="overlay hidden">
+  <div class="panel wide">
+    <h1>だれがプレイしますか？</h1>
+    <p id="selectMsg"></p>
+    <div id="plist" class="plist"></div>
+    <div>
+      <button id="btnNewPlayer" class="dwell">＋ 新規登録</button>
+      <button id="btnGuest" class="dwell">ゲストで遊ぶ</button>
+      <button id="btnManage">登録の削除…</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新規登録（名前入力はキーボード） -->
+<div id="register" class="overlay hidden">
+  <div class="panel">
+    <h1>新規登録</h1>
+    <p>名前（ニックネーム）を入力してください</p>
+    <input id="regName" type="text" maxlength="20" autocomplete="off">
+    <p id="regMsg"></p>
+    <div>
+      <button id="btnRegOk" class="primary">登録（Enter）</button>
+      <button id="btnRegBack">戻る</button>
+    </div>
+  </div>
+</div>
+
+<!-- 登録の削除（誤操作防止のためマウスのみ） -->
+<div id="manage" class="overlay hidden">
+  <div class="panel">
+    <h1>登録の削除</h1>
+    <p>削除すると、その人のスコア記録も消えます。</p>
+    <table class="rank" id="manageList"></table>
+    <button id="btnManageClose">閉じる</button>
+  </div>
+</div>
+
+<!-- ランキング（タイトルから） -->
+<div id="ranking" class="overlay hidden">
+  <div class="panel">
+    <h1>🏆 ランキング</h1>
+    <p id="rankingMsg"></p>
+    <table class="rank" id="rankingTable"></table>
+    <button id="btnRankingClose" class="primary">タイトルへ戻る</button>
+  </div>
+</div>
+
 <!-- ゲームオーバー -->
 <div id="over" class="overlay hidden">
   <div class="panel">
     <h1>ゲームオーバー</h1>
     <p id="overScore"></p>
+    <div id="overRank"></div>
     <div>
-      <button id="btnRetry" class="primary">もう一度</button>
-      <button id="btnRecalib">再校正</button>
-      <button id="btnMenu">タイトルへ</button>
+      <button id="btnRetry" class="primary dwell">もう一度</button>
+      <button id="btnSwitch" class="dwell">プレイヤー交代</button>
+      <button id="btnRecalib" class="dwell">再校正</button>
+      <button id="btnMenu" class="dwell">タイトルへ</button>
     </div>
-    <p style="font-size:13px">Space キーでも再スタート</p>
+    <p style="font-size:13px">ボタンは 1 秒見つめても押せます。Space キーでも再スタート</p>
   </div>
 </div>
 
@@ -90,6 +167,9 @@
   const cvs = document.getElementById('game');
   const ctx = cvs.getContext('2d');
   const $ = id => document.getElementById(id);
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const show = id => $(id).classList.remove('hidden');
+  const hide = id => $(id).classList.add('hidden');
 
   let W = 0, H = 0, dpr = 1;
   function resize() {
@@ -103,10 +183,31 @@
 
   // ---------- 入力（視線 / マウス） ----------
   let inputMode = null;           // 'tobii' | 'gaze'(Webカメラ) | 'mouse'
-  const target = { x: W / 2, y: H * 0.75 };   // 生の注視点（平滑化済み）
+  const target = { x: W / 2, y: H * 0.75 };   // 注視点（平滑化済み）
   let rawGaze = null;
-  // 視線ノイズ除去の指数移動平均係数。Tobii はノイズが小さいので追従を速くする
-  const GAZE_SMOOTH = { tobii: 0.35, gaze: 0.15 };
+  // Webカメラの視線ノイズ除去（毎フレームの指数移動平均係数）
+  const GAZE_SMOOTH = { gaze: 0.15 };
+
+  // Tobii の揺れ補正は One Euro フィルタ（Casiez et al., 2012）。
+  // 視線が止まっているときは強くなめらかにし、速く動いたときは補正を弱めて遅れを減らす。
+  //   ONE_EURO_MIN_CUTOFF [Hz]：止まっているときの揺れの抑え具合（小さいほど揺れないが遅れる）
+  //   ONE_EURO_BETA：速さに応じて補正を弱める度合い（大きいほど速い動きの遅れが減る）
+  const ONE_EURO_MIN_CUTOFF = 1.5, ONE_EURO_BETA = 0.01, ONE_EURO_D_CUTOFF = 1.0;
+  class OneEuro {
+    constructor() { this.reset(); }
+    reset() { this.x = null; this.dx = 0; this.t = 0; }
+    static alpha(cutoff, dt) { const r = 2 * Math.PI * cutoff * dt; return r / (r + 1); }
+    filter(v, t) {
+      if (this.x === null) { this.x = v; this.t = t; return v; }
+      const dt = Math.max(1e-3, t - this.t); this.t = t;
+      const ad = OneEuro.alpha(ONE_EURO_D_CUTOFF, dt);
+      this.dx = ad * ((v - this.x) / dt) + (1 - ad) * this.dx;
+      const a = OneEuro.alpha(ONE_EURO_MIN_CUTOFF + ONE_EURO_BETA * Math.abs(this.dx), dt);
+      this.x = a * v + (1 - a) * this.x;
+      return this.x;
+    }
+  }
+  const euroX = new OneEuro(), euroY = new OneEuro();
 
   addEventListener('mousemove', e => {
     if (inputMode === 'mouse') { target.x = e.clientX; target.y = e.clientY; }
@@ -126,7 +227,7 @@
     webgazer.params.showVideoPreview = true;
     webgazer.params.saveDataAcrossSessions = false;
     await webgazer.setRegression('ridge')
-      .setGazeListener(data => { if (data) rawGaze = { x: data.x, y: data.y }; })
+      .setGazeListener(data => { if (data && inputMode === 'gaze') rawGaze = { x: data.x, y: data.y }; })
       .begin();
     webgazer.showPredictionPoints(false);   // 独自に描画する
     webgazer.showFaceOverlay(false);
@@ -138,12 +239,39 @@
     if (inputMode === 'mouse' || !rawGaze) return;
     const gx = Math.min(W, Math.max(0, rawGaze.x));
     const gy = Math.min(H, Math.max(0, rawGaze.y));
+    if (inputMode === 'tobii') { target.x = gx; target.y = gy; return; }   // 受信時に One Euro で補正済み
     const k = GAZE_SMOOTH[inputMode];
     target.x += (gx - target.x) * k;
     target.y += (gy - target.y) * k;
   }
 
-  // ---------- Tobii（tobii_bridge.py と WebSocket で通信） ----------
+  // ---------- 見つめて押すボタン（dwell） ----------
+  // 表示中の button.dwell を注視点が DWELL_SEC 秒見続けたらクリックする
+  const DWELL_SEC = 1.0;
+  let dwellEl = null, dwellT = 0;
+
+  function updateDwell(dt) {
+    const btns = [...document.querySelectorAll('button.dwell')].filter(b => b.offsetParent !== null);
+    const active = inputMode && inputMode !== 'mouse' && btns.length > 0;
+    $('gazeCursor').classList.toggle('hidden', !active);
+    if (!active) { setDwell(null); return; }
+    $('gazeCursor').style.left = target.x + 'px'; $('gazeCursor').style.top = target.y + 'px';
+    const el = btns.find(b => {
+      const r = b.getBoundingClientRect();
+      return target.x >= r.left && target.x <= r.right && target.y >= r.top && target.y <= r.bottom;
+    }) || null;
+    if (el !== dwellEl) { setDwell(el); return; }
+    if (!el) return;
+    dwellT += dt;
+    el.style.setProperty('--p', Math.min(1, dwellT / DWELL_SEC));
+    if (dwellT >= DWELL_SEC) { setDwell(null); el.click(); }
+  }
+  function setDwell(el) {
+    if (dwellEl) dwellEl.style.setProperty('--p', 0);
+    dwellEl = el; dwellT = 0;
+  }
+
+  // ---------- ブリッジ（tobii_bridge.py と WebSocket で通信） ----------
   // Tobii の座標はモニター全体を 0-1 に正規化したもの。全画面ならページ座標と一致する。
   // 全画面でない場合はウィンドウ位置から概算する（ブラウザ枠の厚みは推定）。
   function screenToClient(nx, ny) {
@@ -157,25 +285,28 @@
     return { x: (x + screenX + bx) / screen.width, y: (y + screenY + top) / screen.height };
   }
 
-  let ws = null, tobiiInfo = null, lastValidGaze = 0;
+  let ws = null, bridgeInfo = null, lastValidGaze = 0;
   const wsWaiters = [];           // { type, resolve, reject }
+  const bridgeOK = () => ws && ws.readyState === WebSocket.OPEN && bridgeInfo;
 
-  function connectTobii() {
+  // Tobii の視線のほか、プレイヤー登録・スコア保存もブリッジが担う（マウス/Webカメラモードでも使う）
+  function connectBridge() {
     return new Promise((resolve, reject) => {
-      if (ws && ws.readyState === WebSocket.OPEN && tobiiInfo) return resolve(tobiiInfo);
+      if (bridgeOK()) return resolve(bridgeInfo);
+      if (location.protocol === 'file:') return reject(new Error('file:// では接続しません'));
       // ブリッジを --ws-port で別ポート起動した場合は ?ws=<port> を付けて開く
-      ws = new WebSocket(`ws://localhost:${new URLSearchParams(location.search).get('ws') || 8765}`);
+      ws = new WebSocket(`ws://127.0.0.1:${new URLSearchParams(location.search).get('ws') || 8765}`);
       const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 3000);
       ws.onerror = () => { clearTimeout(timer); reject(new Error('ブリッジに接続できません')); };
       ws.onclose = () => {
-        tobiiInfo = null;
-        if (inputMode === 'tobii' && state !== 'title') setStatus('⚠ Tobii ブリッジとの接続が切れました');
+        bridgeInfo = null;
+        if (state !== 'title') setStatus('⚠ ブリッジとの接続が切れました（スコアは保存されません）');
       };
       ws.onmessage = ev => {
         const m = JSON.parse(ev.data);
-        if (m.type === 'hello') { clearTimeout(timer); tobiiInfo = m; resolve(m); return; }
+        if (m.type === 'hello') { clearTimeout(timer); bridgeInfo = m; resolve(m); return; }
         if (m.type === 'gaze') {
-          if (m.valid) { rawGaze = screenToClient(m.x, m.y); lastValidGaze = performance.now(); }
+          if (inputMode === 'tobii') handleTobiiGaze(m);
           return;
         }
         const i = wsWaiters.findIndex(w => w.type === m.type || m.type === 'error');
@@ -185,6 +316,51 @@
         }
       };
     });
+  }
+
+  // ---------- Tobii の視線サンプルの処理（瞬き対策つき） ----------
+  // 瞬きの直前・直後は、まぶたが瞳孔を隠して視線が下にずれたように計測される（Tobii は「有効」として返す）。
+  //  - 目を検出できないサンプルが BLINK_MIN_SAMPLES 個続いたら瞬きとみなし、
+  //    注視点とプレイヤーを、瞬きが始まる BLINK_ROLLBACK_MS 前の位置に戻す（直前のずれを取り消す）
+  //  - 目が再び検出されてから BLINK_POST_IGNORE_MS の間のサンプルは捨てる（直後のずれを使わない）
+  // 1〜2 サンプルだけの欠けは瞬きではないので、そのまま直前の位置を保つ
+  const BLINK_MIN_SAMPLES = 3, BLINK_ROLLBACK_MS = 100, BLINK_POST_IGNORE_MS = 120;
+  const BLINK_FIX = !new URLSearchParams(location.search).has('noblink');   // 比較用：?noblink で瞬き処理を切る
+  let gazeHist = [], playerHist = [];   // {t, x, y}：直近 0.5 秒の注視点（補正後）とプレイヤー位置
+  let invalidRun = 0, firstInvalidT = 0, ignoreUntil = 0, needFilterReset = false;
+  let validationBuf = null;             // キャリブレーション検証中だけ { valid: [{x,y}], invalid: n }
+
+  function handleTobiiGaze(m) {
+    const now = performance.now();
+    if (validationBuf) {
+      if (m.valid) validationBuf.valid.push(screenToClient(m.x, m.y)); else validationBuf.invalid++;
+    }
+    if (!m.valid) {
+      if (invalidRun++ === 0) firstInvalidT = now;
+      if (BLINK_FIX && invalidRun === BLINK_MIN_SAMPLES) rollbackTo(firstInvalidT - BLINK_ROLLBACK_MS);
+      return;
+    }
+    if (BLINK_FIX && invalidRun >= BLINK_MIN_SAMPLES) { ignoreUntil = now + BLINK_POST_IGNORE_MS; needFilterReset = true; }
+    invalidRun = 0;
+    if (now < ignoreUntil) return;
+    // 瞬きのあとは補正を初期化し、瞬き前の位置から引きずらないようにする
+    if (needFilterReset) { euroX.reset(); euroY.reset(); needFilterReset = false; }
+    // 描画フレームを待たず、サンプルが届くたびに（120 Hz）補正する
+    const p = screenToClient(m.x, m.y), t = now / 1000;
+    rawGaze = { x: euroX.filter(p.x, t), y: euroY.filter(p.y, t) };
+    lastValidGaze = now;
+    gazeHist.push({ t: now, x: rawGaze.x, y: rawGaze.y });
+    while (gazeHist[0].t < now - 500) gazeHist.shift();
+  }
+
+  function rollbackTo(t) {
+    const lastBefore = hist => { for (let i = hist.length - 1; i >= 0; i--) if (hist[i].t <= t) return hist[i]; return null; };
+    const g = lastBefore(gazeHist);
+    if (!g) return;
+    rawGaze = { x: g.x, y: g.y }; target.x = g.x; target.y = g.y;
+    gazeHist = gazeHist.filter(h => h.t <= t);
+    const p = (state === 'countdown' || state === 'play') && player ? lastBefore(playerHist) : null;
+    if (p) { player.x = p.x; player.y = p.y; player.trail = []; playerHist = playerHist.filter(h => h.t <= t); }
   }
 
   function wsRequest(msg, replyType) {
@@ -202,18 +378,17 @@
     return new Promise(resolve => {
       buttons.forEach(([label, value, primary]) => {
         const b = document.createElement('button');
-        b.textContent = label; if (primary) b.className = 'primary';
-        b.onclick = () => { $('tobiiPanel').classList.add('hidden'); resolve(value); };
+        b.textContent = label; b.className = 'dwell' + (primary ? ' primary' : '');
+        b.onclick = () => { hide('tobiiPanel'); resolve(value); };
         box.appendChild(b);
       });
-      $('tobiiPanel').classList.remove('hidden');
+      show('tobiiPanel');
     });
   }
 
   // 5 点キャリブレーション。点が縮んでいく間に見つめてもらい、縮みきったら Tobii に記録させる
   let calibDot = null;
   const CALIB_POINTS = [[0.5, 0.5], [0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]];
-  const wait = ms => new Promise(r => setTimeout(r, ms));
 
   async function tobiiCalibrate() {
     state = 'calib';
@@ -227,36 +402,100 @@
       }
       calibDot = null;
       const res = await wsRequest({ type: 'calib_compute' }, 'calib_result');
-      const errPx = res.error == null ? null : Math.round(res.error * Math.hypot(W, H) / Math.SQRT2);
-      return res.ok
-        ? `キャリブレーション成功（${res.points} 点使用${errPx != null ? `、平均誤差 約 ${errPx} px` : ''}）`
-        : 'キャリブレーションに失敗しました。姿勢を整えてやり直してください。';
+      return { ok: res.ok, text: res.ok ? '' : 'キャリブレーションの計算に失敗しました（点を見ている間に目を検出できなかった可能性があります）。' };
     } catch (e) {
       calibDot = null;
       await wsRequest({ type: 'calib_abort' });
-      return 'エラー: ' + e.message;
+      return { ok: false, text: 'エラー: ' + e.message };
     }
   }
 
-  // 接続確認 → キャリブレーション（任意）→ ゲーム開始
+  // ---------- キャリブレーションの検証 ----------
+  // キャリブレーションとは別の点（緑）を見てもらい、実際の注視点が点からどれだけずれるかを測る。
+  // 補正前の生の視線の中央値と点の距離 [px] を各点で求め、平均が基準以下なら合格。
+  // 基準 40 px は、この PC の実験環境（Tobii_pro/config.py：幅 51.2 cm・距離 61 cm・1920 px）で約 1°
+  const VALID_POINTS = [[0.3, 0.3], [0.7, 0.3], [0.3, 0.7], [0.7, 0.7]];
+  const CALIB_MAX_ERROR_PX = 40;     // 平均のずれの上限
+  const CALIB_MAX_LOSS_PCT = 20;     // 目を検出できなかったサンプルの割合の上限
+  const CALIB_MAX_ATTEMPTS = 3;      // 基準に届かないとき自動でやり直す回数の上限（無限ループ防止）
+  const VALID_SETTLE_MS = 800, VALID_COLLECT_MS = 600;
+
+  async function tobiiValidate() {
+    state = 'calib';
+    const errs = [];
+    let invalid = 0, total = 0;
+    const median = a => { const s = [...a].sort((p, q) => p - q); return s[s.length >> 1]; };
+    for (const [fx, fy] of VALID_POINTS) {
+      calibDot = { x: fx * W, y: fy * H, t0: performance.now(), dur: VALID_SETTLE_MS, color: '#3fb950' };
+      await wait(VALID_SETTLE_MS);           // 視線が点に移って落ち着くのを待つ
+      validationBuf = { valid: [], invalid: 0 };
+      await wait(VALID_COLLECT_MS);
+      const buf = validationBuf; validationBuf = null;
+      invalid += buf.invalid; total += buf.invalid + buf.valid.length;
+      if (buf.valid.length >= 5) {
+        errs.push(Math.hypot(median(buf.valid.map(v => v.x)) - calibDot.x, median(buf.valid.map(v => v.y)) - calibDot.y));
+      }
+    }
+    calibDot = null;
+    return {
+      complete: errs.length === VALID_POINTS.length,   // 全点で目を検出できたか
+      meanPx: errs.length ? errs.reduce((a, b) => a + b) / errs.length : null,
+      maxPx: errs.length ? Math.max(...errs) : null,
+      lossPct: total ? 100 * invalid / total : 100,
+    };
+  }
+
+  function validationText(v) {
+    const crit = `基準：平均のずれ ${CALIB_MAX_ERROR_PX} px 以下、目を検出できなかった割合 ${CALIB_MAX_LOSS_PCT}% 以下`;
+    if (!v.complete) return `目を検出できない点がありました（検出できなかった割合 ${Math.round(v.lossPct)}%）<br>${crit}`;
+    return `平均のずれ ${Math.round(v.meanPx)} px（最大 ${Math.round(v.maxPx)} px）、目を検出できなかった割合 ${Math.round(v.lossPct)}%<br>${crit}`;
+  }
+
+  // ボタンなしでしばらく表示する
+  async function tobiiNotice(title, msg, ms) {
+    $('tobiiTitle').textContent = title; $('tobiiMsg').innerHTML = msg; $('tobiiBtns').innerHTML = '';
+    show('tobiiPanel'); await wait(ms); hide('tobiiPanel');
+  }
+
+  // 接続確認 → キャリブレーション → 検証。基準に届かなければ自動でやり直す（任意でスキップ可）
   async function tobiiSetup(skipConnectMsg) {
-    let msg = skipConnectMsg ? '' :
-      `接続しました：${tobiiInfo.model}（${tobiiInfo.freq} Hz${tobiiInfo.mode === 'mock' ? '、マウスで代用中' : ''}）<br>`;
-    let choice = await tobiiPanel('Tobii', msg +
-      'キャリブレーションでは、画面に順に出る点が縮みきるまで見つめてください。', [
+    state = 'calib';
+    const msg = skipConnectMsg ? '' :
+      `接続しました：${bridgeInfo.model}（${bridgeInfo.freq} Hz${bridgeInfo.mode === 'mock' ? '、マウスで代用中' : ''}）<br>`;
+    const first = await tobiiPanel('Tobii', msg +
+      'キャリブレーションでは、画面に順に出る<b style="color:var(--danger)">赤い点</b>が縮みきるまで見つめてください。<br>' +
+      '続けて<b style="color:var(--ok)">緑の点</b>で精度を確かめます。', [
         ['キャリブレーション開始', 'calib', true], ['スキップ（現在の校正を使う）', 'skip']]);
-    while (choice === 'calib') {
-      const result = await tobiiCalibrate();
-      choice = await tobiiPanel('キャリブレーション', result, [['ゲーム開始', 'play', true], ['やり直す', 'calib']]);
+    if (first === 'skip') return;
+
+    for (let attempt = 1; ; attempt++) {
+      const cal = await tobiiCalibrate();
+      const val = cal.ok ? await tobiiValidate() : null;
+      const pass = val && val.complete && val.meanPx <= CALIB_MAX_ERROR_PX && val.lossPct <= CALIB_MAX_LOSS_PCT;
+      const detail = val ? validationText(val) : cal.text;
+      if (pass) {
+        if (await tobiiPanel('キャリブレーション OK', detail, [['次へ', 'next', true], ['やり直す', 'calib']]) === 'next') return;
+        attempt = 0;
+        continue;
+      }
+      if (attempt < CALIB_MAX_ATTEMPTS) {
+        await tobiiNotice('精度が基準に届きませんでした', detail +
+          `<br><br>姿勢を整えて、もう一度行います（${attempt + 1} / ${CALIB_MAX_ATTEMPTS} 回目）`, 3500);
+        continue;
+      }
+      const c = await tobiiPanel('精度が基準に届きません', detail +
+        `<br><br>${CALIB_MAX_ATTEMPTS} 回続けて基準に届きませんでした。画面との距離（60 cm 前後）・頭の位置・メガネの反射・照明を確かめてください。`,
+        [['もう一度', 'calib', true], ['このまま進む', 'next']]);
+      if (c === 'next') return;
+      attempt = 0;
     }
-    reset();
   }
 
-  // ---------- 校正 ----------
+  // ---------- Webカメラ校正 ----------
   function calibrate() {
     return new Promise(resolve => {
       state = 'calib';
-      $('calibMsg').classList.remove('hidden');
+      show('calibMsg');
       const fr = [0.08, 0.5, 0.92];
       const pts = [];
       let remaining = 9;
@@ -272,7 +511,7 @@
             b.classList.add('done');
             if (--remaining === 0) {
               pts.forEach(p => p.remove());
-              $('calibMsg').classList.add('hidden');
+              hide('calibMsg');
               resolve();
             }
           }
@@ -282,39 +521,231 @@
     });
   }
 
+  // ---------- プレイヤー（登録・選択） ----------
+  // 本人確認は「両目の間隔（瞳孔間距離）が近い人を上に並べる」だけにとどめ、最後は本人が名前を見つめて選ぶ。
+  // 両目の間隔は人によって数 mm しか違わないため、自動で決め打ちはしない。
+  const IPD_MATCH_MM = 2.0;       // この差以内なら「候補」として強調する
+  let currentPlayer = null;       // null = ゲスト
+  let players = [];
+  let measuredIpd = null;
+  let selectResolve = null;
+
+  async function measureIpd(seconds) {
+    if (inputMode !== 'tobii' || !bridgeOK()) return null;
+    const res = await wsRequest({ type: 'ipd_measure', seconds }, 'ipd_result');
+    return res.ipd;
+  }
+
+  // プレイヤーを選んでもらう（ブリッジがなければゲスト）
+  async function choosePlayer() {
+    if (!bridgeOK()) { currentPlayer = null; return; }
+    state = 'select';
+    $('plist').innerHTML = '';
+    $('selectMsg').textContent = inputMode === 'tobii'
+      ? '目の間隔を測っています…画面を見たまま少し待ってください' : '読み込み中…';
+    show('select');
+    const picked = new Promise(r => { selectResolve = r; });
+    try {
+      measuredIpd = await measureIpd(1.5);
+      players = (await wsRequest({ type: 'players_get' }, 'players')).players;
+      renderPlayerList();
+    } catch (e) {
+      $('selectMsg').textContent = 'エラー: ' + e.message;
+    }
+    currentPlayer = await picked;
+    hide('select'); hide('register');
+  }
+
+  function renderPlayerList() {
+    const list = players.map(p => ({ ...p, diff: (measuredIpd != null && p.ipd != null) ? Math.abs(p.ipd - measuredIpd) : null }));
+    if (measuredIpd != null) list.sort((a, b) => (a.diff ?? 99) - (b.diff ?? 99));
+    const how = inputMode === 'mouse' ? 'クリックして選んでください。' : '自分の名前を 1 秒見つめると選べます。';
+    $('selectMsg').textContent = (players.length ? how : 'まだ登録がありません。「新規登録」から登録してください。') +
+      (measuredIpd != null ? `（あなたの目の間隔：${measuredIpd.toFixed(1)} mm）` : '');
+    const box = $('plist'); box.innerHTML = '';
+    list.forEach((p, i) => {
+      const b = document.createElement('button');
+      const isCand = i === 0 && p.diff != null && p.diff <= IPD_MATCH_MM;
+      b.className = 'dwell' + (isCand ? ' primary' : '');
+      b.textContent = p.name;
+      const sub = document.createElement('small');
+      sub.textContent = `ベスト ${p.best}` + (p.diff != null ? ` ・ 差 ${p.diff.toFixed(1)} mm` : '');
+      b.appendChild(sub);
+      if (isCand) { const t = document.createElement('span'); t.className = 'tag'; t.textContent = '候補'; b.appendChild(t); }
+      b.onclick = () => selectResolve(p);
+      box.appendChild(b);
+    });
+  }
+
+  $('btnGuest').onclick = () => selectResolve && selectResolve(null);
+  $('btnNewPlayer').onclick = () => {
+    hide('select'); show('register');
+    $('regName').value = ''; $('regMsg').textContent = '';
+    $('regName').focus();
+  };
+  $('btnRegBack').onclick = () => { hide('register'); show('select'); };
+  $('regName').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnRegOk').click(); });
+  $('btnRegOk').onclick = async () => {
+    const name = $('regName').value.trim();
+    if (!name) { $('regMsg').textContent = '名前を入力してください'; return; }
+    $('btnRegOk').disabled = true;
+    try {
+      let ipd = null;
+      if (inputMode === 'tobii') {
+        $('regMsg').textContent = '目の間隔を測っています…画面の中央を見て、姿勢を保ってください（2 秒）';
+        ipd = await measureIpd(2.0);
+        if (ipd == null) $('regMsg').textContent = '目を検出できなかったため、目の間隔なしで登録します';
+      }
+      players = (await wsRequest({ type: 'player_add', name, ipd }, 'players')).players;
+      selectResolve(players.find(p => p.name === name));
+    } catch (e) {
+      $('regMsg').textContent = e.message;
+    } finally {
+      $('btnRegOk').disabled = false;
+    }
+  };
+
+  $('btnManage').onclick = () => {
+    const tbl = $('manageList'); tbl.innerHTML = '';
+    players.forEach(p => {
+      const tr = tbl.insertRow();
+      tr.insertCell().textContent = p.name;
+      tr.insertCell().textContent = `${p.plays} 回 / ベスト ${p.best}`;
+      const b = document.createElement('button'); b.className = 'danger'; b.textContent = '削除';
+      b.onclick = async () => {
+        if (!confirm(`「${p.name}」の登録とスコア記録を削除しますか？`)) return;
+        players = (await wsRequest({ type: 'player_delete', id: p.id }, 'players')).players;
+        $('btnManage').onclick();
+        renderPlayerList();
+      };
+      tr.insertCell().appendChild(b);
+    });
+    if (!players.length) tbl.insertRow().insertCell().textContent = '登録はありません';
+    hide('select'); show('manage');
+  };
+  $('btnManageClose').onclick = () => { hide('manage'); show('select'); };
+
+  function renderRanking(list, meId) {
+    const box = $('overRank'); box.innerHTML = '';
+    if (!list || !list.length) return;
+    const tbl = document.createElement('table'); tbl.className = 'rank';
+    const top = list.slice(0, 5);
+    const meIdx = list.findIndex(p => p.id === meId);
+    if (meIdx >= 5) top.push(list[meIdx]);
+    top.forEach(p => {
+      const tr = tbl.insertRow(); if (p.id === meId) tr.className = 'me';
+      tr.insertCell().textContent = (list.indexOf(p) + 1) + '位';
+      tr.insertCell().textContent = p.name;
+      tr.insertCell().textContent = p.best;
+    });
+    box.appendChild(tbl);
+  }
+
   // ---------- ゲーム本体 ----------
-  let state = 'title';            // title | calib | countdown | play | over
+  let state = 'title';            // title | calib | select | countdown | play | over
   let player = null, obstacles = [], particles = [], elapsed = 0, spawnTimer = 0, countdown = 0, lastT;
-  let best = +(localStorageGet('gazeDodgeBest') || 0);
-  $('best').textContent = 'ベスト: ' + best;
+  let guestBest = +(localStorageGet('gazeDodgeBest') || 0);
 
   function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
   function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
 
   function reset() {
     player = { x: W / 2, y: H * 0.75, r: 18, trail: [] };
+    playerHist = [];
     target.x = player.x; target.y = player.y;
     obstacles = []; particles = [];
     elapsed = 0; spawnTimer = 0; countdown = 3;
     state = 'countdown';
-    $('hud').classList.remove('hidden');
-    $('over').classList.add('hidden');
+    show('hud'); hide('over');
+    $('who').textContent = '👤 ' + (currentPlayer ? currentPlayer.name : 'ゲスト');
+    $('score').textContent = 'スコア: 0';
+    $('best').textContent = 'ベスト: ' + (currentPlayer ? currentPlayer.best : guestBest);
     $('mode').textContent = { tobii: '👁 Tobii', gaze: '📷 Webカメラ', mouse: '🖱 マウス' }[inputMode];
   }
 
   // 難易度: 時間とともに出現頻度・速度が上がる
   function difficulty() { return 1 + elapsed / 25; }
 
+  // 横バーの隙間の幅 [px]。序盤は一定で、BAR_NARROW_FROM 秒を過ぎたら少しずつ狭まる。
+  // 最小幅はプレイヤーの直径(36px)と視線の誤差を見込んだ値
+  const BAR_GAP_START = 260, BAR_GAP_MIN = 100, BAR_NARROW_FROM = 20, BAR_NARROW_PER_SEC = 1.5;
+  function barGap() {
+    return Math.max(BAR_GAP_MIN, BAR_GAP_START - Math.max(0, elapsed - BAR_NARROW_FROM) * BAR_NARROW_PER_SEC);
+  }
+
+  // ---------- 画像の障害物（obstacles/obstacles.json） ----------
+  // 岩の一部を画像に置き換える。設定や画像がなければ今までどおり岩だけ
+  let imageObstacles = { probability: 0, images: [] };   // images: [{ file, img, size:[min,max], weight, hitbox, spin, aspect, mask }]
+  const MASK_MAX = 128;            // 形どおりの当たり判定に使う透明度マップの解像度（長辺 px）
+
+  async function loadImageObstacles() {
+    if (location.protocol === 'file:') return;           // 直接開いた場合は設定ファイルを読めない
+    try {
+      const res = await fetch('obstacles/obstacles.json', { cache: 'no-store' });
+      if (!res.ok) return;                                // 設定がなければ画像の障害物なし
+      const cfg = await res.json();
+      const defs = cfg.images || [];
+      const loaded = (await Promise.all(defs.map(loadObstacleImage))).filter(Boolean);
+      imageObstacles = { probability: Math.min(1, Math.max(0, +cfg.probability || 0)), images: loaded };
+      const failed = defs.length - loaded.length;
+      if (failed) setStatus(`⚠ 障害物の画像 ${failed} 個を読み込めませんでした（ファイル名を確認してください。詳細はコンソール）`);
+    } catch (e) {
+      setStatus('⚠ obstacles/obstacles.json を読み込めませんでした（書式を確認してください）：' + e.message);
+    }
+  }
+
+  function loadObstacleImage(def) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        const nw = img.naturalWidth || 100, nh = img.naturalHeight || 100;
+        const sz = Array.isArray(def.size) ? def.size : [def.size ?? 80, def.size ?? 80];
+        const hitbox = ['alpha', 'circle', 'box'].includes(def.hitbox) ? def.hitbox : 'alpha';
+        resolve({ file: def.file, img, size: [+sz[0], +(sz[1] ?? sz[0])], weight: Math.max(0, def.weight ?? 1),
+                  hitbox, spin: !!def.spin, aspect: nh / nw, mask: hitbox === 'alpha' ? buildAlphaMask(img, nw, nh) : null });
+      };
+      img.onerror = () => { console.warn('障害物の画像を読み込めません:', def.file); resolve(null); };
+      img.src = 'obstacles/' + encodeURIComponent(def.file);
+    });
+  }
+
+  // 画像の透明度（α）を縮小して保持する。α が 128 以上の画素を「当たる部分」とみなす
+  function buildAlphaMask(img, nw, nh) {
+    const s = MASK_MAX / Math.max(nw, nh);
+    const w = Math.max(1, Math.round(nw * s)), h = Math.max(1, Math.round(nh * s));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.drawImage(img, 0, 0, w, h);
+    const px = g.getImageData(0, 0, w, h).data, a = new Uint8Array(w * h);
+    for (let i = 0; i < a.length; i++) a[i] = px[i * 4 + 3];
+    return { w, h, a };
+  }
+
+  function pickObstacleImage() {
+    const list = imageObstacles.images, total = list.reduce((s, im) => s + im.weight, 0);
+    if (!total) return null;
+    let r = Math.random() * total;
+    return list.find(im => (r -= im.weight) < 0) || list[list.length - 1];
+  }
+
   function spawnObstacle() {
     const d = difficulty();
     const kind = Math.random() < Math.min(0.35, elapsed / 120) ? 'bar' : 'rock';
+    const im = kind === 'rock' && Math.random() < imageObstacles.probability ? pickObstacleImage() : null;
     if (kind === 'bar') {
       // 横長のバー（隙間あり）
-      const gap = Math.max(140, 260 - elapsed * 1.5);
+      const gap = barGap();
       const gx = 40 + Math.random() * (W - gap - 80);
       const h = 22, vy = 140 * d;
       obstacles.push({ type: 'rect', x: 0, y: -h, w: gx, h, vx: 0, vy });
       obstacles.push({ type: 'rect', x: gx + gap, y: -h, w: W - gx - gap, h, vx: 0, vy });
+    } else if (im) {
+      // 画像の障害物（x, y は中心）。動き方は岩と同じ
+      const w = im.size[0] + Math.random() * (im.size[1] - im.size[0]), h = w * im.aspect;
+      obstacles.push({
+        type: 'image', im, x: Math.random() * W, y: -Math.max(w, h) / 2, w, h,
+        vx: (Math.random() - 0.5) * 80 * d, vy: (160 + Math.random() * 140) * d,
+        rot: im.spin ? Math.random() * Math.PI * 2 : 0, vr: im.spin ? (Math.random() - 0.5) * 3 : 0,
+      });
     } else {
       const r = 14 + Math.random() * 26;
       obstacles.push({
@@ -327,9 +758,35 @@
 
   function hit(o, p) {
     if (o.type === 'circle') return Math.hypot(o.x - p.x, o.y - p.y) < o.r + p.r * 0.85;
+    if (o.type === 'image') return hitImage(o, p);
     const cx = Math.max(o.x, Math.min(p.x, o.x + o.w));
     const cy = Math.max(o.y, Math.min(p.y, o.y + o.h));
     return Math.hypot(cx - p.x, cy - p.y) < p.r * 0.85;
+  }
+
+  function hitImage(o, p) {
+    const pr = p.r * 0.85;
+    // プレイヤーの中心を画像の座標系（画像の中心が原点、回転を戻した向き）に移す
+    const c = Math.cos(-o.rot), s = Math.sin(-o.rot), dx = p.x - o.x, dy = p.y - o.y;
+    const lx = dx * c - dy * s, ly = dx * s + dy * c;
+    if (Math.abs(lx) > o.w / 2 + pr || Math.abs(ly) > o.h / 2 + pr) return false;
+    if (o.im.hitbox === 'circle') return Math.hypot(lx, ly) < Math.min(o.w, o.h) / 2 + pr;
+    if (o.im.hitbox === 'box') {
+      const cx = Math.max(-o.w / 2, Math.min(lx, o.w / 2)), cy = Math.max(-o.h / 2, Math.min(ly, o.h / 2));
+      return Math.hypot(cx - lx, cy - ly) < pr;
+    }
+    // 形どおり：プレイヤーの円の中心・半径の半分・周上の点のどれかが、画像の不透明な部分に重なれば当たり
+    const m = o.im.mask;
+    const opaque = (x, y) => {
+      const u = Math.floor((x / o.w + 0.5) * m.w), v = Math.floor((y / o.h + 0.5) * m.h);
+      return u >= 0 && v >= 0 && u < m.w && v < m.h && m.a[v * m.w + u] >= 128;
+    };
+    if (opaque(lx, ly)) return true;
+    for (let k = 0; k < 16; k++) {
+      const a = k * Math.PI / 8, cs = Math.cos(a), sn = Math.sin(a);
+      if (opaque(lx + pr * cs, ly + pr * sn) || (k % 2 === 0 && opaque(lx + pr / 2 * cs, ly + pr / 2 * sn))) return true;
+    }
+    return false;
   }
 
   function explode(x, y) {
@@ -339,18 +796,39 @@
     }
   }
 
-  function gameOver() {
+  async function gameOver() {
     state = 'over';
     explode(player.x, player.y);
-    const sc = Math.floor(elapsed * 10);
-    if (sc > best) { best = sc; localStorageSet('gazeDodgeBest', best); }
-    $('best').textContent = 'ベスト: ' + best;
-    $('overScore').textContent = `スコア ${sc}（${elapsed.toFixed(1)} 秒生存）　ベスト ${best}`;
-    setTimeout(() => { if (state === 'over') $('over').classList.remove('hidden'); }, 700);
+    const sc = Math.floor(elapsed * 10), sec = elapsed;
+    const shown = wait(700);
+    let line = `スコア ${sc}（${sec.toFixed(1)} 秒生存）`;
+    $('overRank').innerHTML = '';
+    try {
+      if (currentPlayer && bridgeOK()) {
+        const res = await wsRequest({ type: 'score_add', id: currentPlayer.id, score: sc, seconds: sec }, 'score_saved');
+        currentPlayer.best = res.best;
+        line += res.is_best ? `　🎉 自己ベスト更新！（${res.rank} 位）` : `　自己ベスト ${res.best}（${res.rank} 位）`;
+        renderRanking(res.players, currentPlayer.id);
+      } else {
+        if (sc > guestBest) { guestBest = sc; localStorageSet('gazeDodgeBest', guestBest); }
+        line += `　ゲストのベスト ${guestBest}（記録はランキングに残りません）`;
+        if (bridgeOK()) renderRanking((await wsRequest({ type: 'players_get' }, 'players')).players, null);
+      }
+    } catch (e) {
+      line += `　⚠ 保存できませんでした：${e.message}`;
+    }
+    $('overScore').textContent = line;
+    $('best').textContent = 'ベスト: ' + (currentPlayer ? currentPlayer.best : guestBest);
+    $('btnSwitch').classList.toggle('hidden', !bridgeOK());
+    $('btnRecalib').classList.toggle('hidden', inputMode === 'mouse');
+    await shown;
+    if (state === 'over') show('over');
   }
 
   function update(dt) {
     updateGazeTarget();
+    updateDwell(dt);
+    document.body.classList.toggle('playing', state === 'countdown' || state === 'play');
 
     if (state === 'countdown') {
       countdown -= dt;
@@ -361,8 +839,8 @@
       movePlayer(dt);
       spawnTimer -= dt;
       if (spawnTimer <= 0) { spawnObstacle(); spawnTimer = Math.max(0.18, 0.9 / difficulty()); }
-      for (const o of obstacles) { o.x += o.vx * dt; o.y += o.vy * dt; }
-      obstacles = obstacles.filter(o => o.y < H + 80);
+      for (const o of obstacles) { o.x += o.vx * dt; o.y += o.vy * dt; if (o.vr) o.rot += o.vr * dt; }
+      obstacles = obstacles.filter(o => (o.type === 'image' ? o.y - Math.max(o.w, o.h) / 2 : o.y) < H + 80);
       if (obstacles.some(o => hit(o, player))) gameOver();
       $('score').textContent = 'スコア: ' + Math.floor(elapsed * 10);
     }
@@ -372,16 +850,23 @@
   }
 
   // プレイヤーは注視点に向かって最大速度付きで追従（視線の飛びで瞬間移動しないように）
+  //   rate [1/s]：残りの距離を毎秒どれだけ詰めるか（大きいほど遅れが小さい。30 なら遅れの目安は約 33 ms）
+  //   maxSpeed [px/s]：最大速度
+  // Tobii・マウスは入力が正確なので速く、ノイズの大きい Webカメラはゆっくり追従させる
+  const FOLLOW = { tobii: { rate: 30, maxSpeed: 3000 }, gaze: { rate: 10, maxSpeed: 700 }, mouse: { rate: 30, maxSpeed: 3000 } };
   function movePlayer(dt) {
-    const maxSpeed = { tobii: 1000, gaze: 700, mouse: 1100 }[inputMode];
+    const { rate, maxSpeed } = FOLLOW[inputMode];
     const dx = target.x - player.x, dy = target.y - player.y;
     const dist = Math.hypot(dx, dy);
-    const step = Math.min(dist, maxSpeed * dt, dist * 10 * dt + 0.5);
+    const step = Math.min(dist, maxSpeed * dt, dist * rate * dt + 0.5);
     if (dist > 0.5) { player.x += dx / dist * step; player.y += dy / dist * step; }
     player.x = Math.max(player.r, Math.min(W - player.r, player.x));
     player.y = Math.max(player.r, Math.min(H - player.r, player.y));
     player.trail.push({ x: player.x, y: player.y });
     if (player.trail.length > 14) player.trail.shift();
+    const now = performance.now();
+    playerHist.push({ t: now, x: player.x, y: player.y });
+    while (playerHist[0].t < now - 500) playerHist.shift();
   }
 
   function draw() {
@@ -395,26 +880,32 @@
 
     if (state === 'calib' && calibDot) {
       const p = Math.min(1, (performance.now() - calibDot.t0) / calibDot.dur);
-      ctx.fillStyle = '#ff6b6b';
+      ctx.fillStyle = calibDot.color || '#ff6b6b';
       ctx.beginPath(); ctx.arc(calibDot.x, calibDot.y, 24 - 16 * p, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = '#fff';
       ctx.beginPath(); ctx.arc(calibDot.x, calibDot.y, 3, 0, Math.PI * 2); ctx.fill();
     }
-    if (!player || state === 'title' || state === 'calib') return;
+    if (!player || state === 'title' || state === 'calib' || state === 'select') return;
 
     // 障害物
     for (const o of obstacles) {
       if (o.type === 'circle') {
         ctx.fillStyle = `hsl(${o.hue},85%,60%)`;
         ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2); ctx.fill();
+      } else if (o.type === 'image') {
+        ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+        ctx.drawImage(o.im.img, -o.w / 2, -o.h / 2, o.w, o.h);
+        ctx.restore();
       } else {
         ctx.fillStyle = '#f0883e'; ctx.fillRect(o.x, o.y, o.w, o.h);
       }
     }
 
     // 注視点マーカー
-    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(target.x, target.y, 10, 0, Math.PI * 2); ctx.stroke();
+    if (state !== 'over') {
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(target.x, target.y, 10, 0, Math.PI * 2); ctx.stroke();
+    }
 
     // プレイヤー
     if (state !== 'over') {
@@ -432,8 +923,8 @@
       ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
     }
 
-    // 瞬きや姿勢の崩れで目が検出できないとき（直前の位置で止まる）
-    if (inputMode === 'tobii' && state !== 'over' && performance.now() - lastValidGaze > 300) {
+    // 姿勢の崩れなどで目が検出できないとき（直前の位置で止まる）。普通の瞬き（0.1〜0.4 秒）では出さない
+    if (inputMode === 'tobii' && state !== 'over' && performance.now() - lastValidGaze > 600) {
       ctx.fillStyle = '#ff6b6b'; ctx.font = 'bold 20px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText('目を検出できません', W / 2, 16);
     }
@@ -453,27 +944,35 @@
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);
+  loadImageObstacles();
 
   // ---------- 画面遷移 ----------
+  // マウス/Webカメラモードでもブリッジが動いていればプレイヤー登録・ランキングを使う
+  async function tryBridge() {
+    try { await connectBridge(); } catch { /* ブリッジなし → ゲスト */ }
+  }
+
   $('btnTobii').addEventListener('click', async () => {
     // 全画面要求はクリック直後（ユーザー操作中）に出す必要がある
     const fs = document.documentElement.requestFullscreen?.().catch(() => {});
-    $('title').classList.add('hidden');
+    hide('title');
     inputMode = 'tobii';
     try {
-      await connectTobii();
+      await connectBridge();
     } catch (e) {
       console.error(e);
       if (document.fullscreenElement) document.exitFullscreen();
       alert('Tobii ブリッジに接続できませんでした。\n先に「python tobii_bridge.py」を起動してから、http://localhost:8000 で開いてください。');
-      $('title').classList.remove('hidden'); state = 'title';
+      show('title'); state = 'title';
       return;
     }
     await Promise.race([fs, wait(1000)]);   // 全画面が許可されない環境でも止まらないように
     await tobiiSetup();
+    await choosePlayer();
+    reset();
   });
   $('btnGaze').addEventListener('click', async () => {
-    $('title').classList.add('hidden');
+    hide('title');
     inputMode = 'gaze';
     try {
       await startWebGazer();
@@ -481,24 +980,74 @@
       console.error(e);
       alert('視線推定を開始できませんでした（カメラ許可・ネット接続を確認してください）。マウスモードで起動します。');
       inputMode = 'mouse';
-      reset(); return;
+      await tryBridge(); await choosePlayer(); reset();
+      return;
     }
     await calibrate();
+    await tryBridge(); await choosePlayer();
     reset();
   });
-  $('btnMouse').addEventListener('click', () => { $('title').classList.add('hidden'); inputMode = 'mouse'; reset(); });
+  $('btnMouse').addEventListener('click', async () => {
+    hide('title'); inputMode = 'mouse';
+    await tryBridge(); await choosePlayer();
+    reset();
+  });
   $('btnRetry').addEventListener('click', reset);
+  $('btnSwitch').addEventListener('click', async () => {
+    hide('over'); hide('hud');
+    await choosePlayer();
+    reset();
+  });
   $('btnRecalib').addEventListener('click', async () => {
-    $('over').classList.add('hidden'); $('hud').classList.add('hidden');
-    if (inputMode === 'tobii') return tobiiSetup(true);
+    hide('over'); hide('hud');
+    if (inputMode === 'tobii') await tobiiSetup(true);
     if (inputMode === 'gaze') { webgazer.clearData(); await calibrate(); }
     reset();
   });
+  // ランキングだけを見る（遊んだことのある登録者を自己ベスト順に全員表示）
+  $('btnRanking').addEventListener('click', async () => {
+    hide('title'); show('ranking');
+    const tbl = $('rankingTable'); tbl.innerHTML = '';
+    $('rankingMsg').textContent = '読み込み中…';
+    try {
+      await connectBridge();
+      const list = (await wsRequest({ type: 'players_get' }, 'players')).players.filter(p => p.plays > 0);
+      $('rankingMsg').textContent = list.length
+        ? '登録プレイヤーの自己ベスト順です（ゲストの記録は含みません）'
+        : 'まだ記録がありません。';
+      if (list.length) {
+        const head = tbl.createTHead().insertRow();
+        ['順位', '名前', 'ベスト', '回数'].forEach(t => { const th = document.createElement('th'); th.textContent = t; head.appendChild(th); });
+      }
+      list.forEach((p, i) => {
+        const tr = tbl.insertRow();
+        tr.insertCell().textContent = (i + 1) + '位';
+        tr.insertCell().textContent = p.name;
+        tr.insertCell().textContent = p.best;
+        tr.insertCell().textContent = p.plays + ' 回';
+      });
+    } catch (e) {
+      $('rankingMsg').textContent = 'ランキングを読み込めませんでした。tobii_bridge.py（run_tobii.bat）を起動してから、http://localhost:8000 で開いてください。';
+    }
+  });
+  $('btnRankingClose').addEventListener('click', () => { hide('ranking'); show('title'); });
   $('btnMenu').addEventListener('click', () => {
-    $('over').classList.add('hidden'); $('hud').classList.add('hidden');
-    $('title').classList.remove('hidden'); state = 'title';
+    hide('over'); hide('hud');
+    show('title'); state = 'title';
   });
   addEventListener('keydown', e => { if (e.code === 'Space' && state === 'over') { e.preventDefault(); reset(); } });
+
+  // 動作確認用：?debug を付けて開くと、コンソールから gazeDebug() で内部の状態を見られる
+  if (new URLSearchParams(location.search).has('debug')) {
+    window.gazeDebug = () => ({ state, target: { ...target }, rawGaze, player: player && { x: player.x, y: player.y },
+      imageObstacles: imageObstacles.images.map(im => ({ file: im.file, size: im.size, hitbox: im.hitbox, mask: im.mask && [im.mask.w, im.mask.h] })),
+      onScreen: obstacles.map(o => o.type) });
+    // 当たり判定を直接試す：1 つ目の画像を幅 100px・中心 (0,0)・回転 rot で置き、プレイヤー中心 (px, py) で当たるか
+    window.gazeDebugHitImage = (px, py, rot = 0) => {
+      const im = imageObstacles.images[0];
+      return hit({ type: 'image', im, x: 0, y: 0, w: 100, h: 100 * im.aspect, rot }, { x: px, y: py, r: 18 });
+    };
+  }
 })();
 </script>
 </body>
