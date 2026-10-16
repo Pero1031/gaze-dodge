@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gaze Dodge</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --danger:#ff6b6b; --ok:#3fb950; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: system-ui, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; display:block; }
+  .overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:10; }
+  .panel { background:rgba(22,27,34,.95); border:1px solid #30363d; border-radius:12px; padding:28px 32px;
+    max-width:560px; width:calc(100% - 32px); text-align:center; }
+  .panel h1 { margin:0 0 8px; font-size:28px; }
+  .panel p { color:var(--muted); line-height:1.7; margin:8px 0; }
+  button { font:inherit; font-size:16px; padding:10px 20px; margin:6px; border-radius:8px; border:1px solid #30363d;
+    background:#21262d; color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#0d1117; font-weight:600; }
+  button:hover { filter:brightness(1.15); }
+  .hidden { display:none !important; }
+  #hud { position:fixed; top:12px; left:16px; z-index:5; font-size:18px; pointer-events:none; text-shadow:0 1px 3px #000; }
+  #hud span { margin-right:18px; }
+  #status { position:fixed; bottom:10px; left:16px; z-index:5; font-size:13px; color:var(--muted); pointer-events:none; }
+  .calib-pt { position:fixed; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%; z-index:20;
+    background:var(--danger); border:3px solid #fff; cursor:pointer; padding:0; transition:background .15s, opacity .2s; }
+  .calib-pt.done { background:var(--ok); pointer-events:none; opacity:.5; }
+  #calibMsg { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:15; text-align:center;
+    color:var(--muted); pointer-events:none; line-height:1.7; }
+  /* WebGazer のカメラ映像を左上に小さく */
+  #webgazerVideoContainer { top:auto !important; bottom:40px !important; left:16px !important; opacity:.8; z-index:30 !important; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud" class="hidden"><span id="score">スコア: 0</span><span id="best">ベスト: 0</span><span id="mode"></span></div>
+<div id="status"></div>
+
+<!-- タイトル -->
+<div id="title" class="overlay">
+  <div class="panel">
+    <h1>👁 Gaze Dodge</h1>
+    <p>視線でプレイヤー（青い丸）を動かし、上から降ってくる障害物を避け続けるゲームです。</p>
+    <p><b style="color:var(--fg)">Tobii モード</b>：先に <code>python tobii_bridge.py</code> を起動しておいてください。全画面で遊びます。<br>
+      <b style="color:var(--fg)">Webカメラモード</b>：<a href="https://webgazer.cs.brown.edu/" style="color:var(--accent)">WebGazer.js</a> で視線を推定します。</p>
+    <div>
+      <button id="btnTobii" class="primary">Tobii で始める</button>
+      <button id="btnGaze">Webカメラで始める</button>
+      <button id="btnMouse">マウス（テスト用）</button>
+    </div>
+    <p style="font-size:13px">カメラ映像・視線データはこの PC 内でのみ処理され、外部に送信されません。</p>
+  </div>
+</div>
+
+<!-- 校正 -->
+<div id="calibMsg" class="hidden">
+  <b style="color:var(--fg);font-size:20px">校正</b><br>
+  各点を<b>見つめながら</b> 5 回クリックしてください（緑になれば完了）。<br>
+  頭はなるべく動かさないでください。
+</div>
+
+<!-- Tobii 接続・キャリブレーション -->
+<div id="tobiiPanel" class="overlay hidden">
+  <div class="panel">
+    <h1 id="tobiiTitle">Tobii</h1>
+    <p id="tobiiMsg"></p>
+    <div id="tobiiBtns"></div>
+  </div>
+</div>
+
+<!-- ゲームオーバー -->
+<div id="over" class="overlay hidden">
+  <div class="panel">
+    <h1>ゲームオーバー</h1>
+    <p id="overScore"></p>
+    <div>
+      <button id="btnRetry" class="primary">もう一度</button>
+      <button id="btnRecalib">再校正</button>
+      <button id="btnMenu">タイトルへ</button>
+    </div>
+    <p style="font-size:13px">Space キーでも再スタート</p>
+  </div>
+</div>
+
+<script src="https://webgazer.cs.brown.edu/webgazer.js" async id="wgScript"></script>
+<script>
+(() => {
+  const cvs = document.getElementById('game');
+  const ctx = cvs.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let W = 0, H = 0, dpr = 1;
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = innerWidth; H = innerHeight;
+    cvs.width = W * dpr; cvs.height = H * dpr;
+    cvs.style.width = W + 'px'; cvs.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------- 入力（視線 / マウス） ----------
+  let inputMode = null;           // 'tobii' | 'gaze'(Webカメラ) | 'mouse'
+  const target = { x: W / 2, y: H * 0.75 };   // 生の注視点（平滑化済み）
+  let rawGaze = null;
+  // 視線ノイズ除去の指数移動平均係数。Tobii はノイズが小さいので追従を速くする
+  const GAZE_SMOOTH = { tobii: 0.35, gaze: 0.15 };
+
+  addEventListener('mousemove', e => {
+    if (inputMode === 'mouse') { target.x = e.clientX; target.y = e.clientY; }
+  });
+
+  function setStatus(t) { $('status').textContent = t; }
+
+  async function startWebGazer() {
+    if (!window.webgazer) {
+      setStatus('WebGazer を読み込み中…');
+      await new Promise((res, rej) => {
+        const s = $('wgScript');
+        s.addEventListener('load', res); s.addEventListener('error', rej);
+        setTimeout(() => window.webgazer ? res() : rej(new Error('timeout')), 15000);
+      });
+    }
+    webgazer.params.showVideoPreview = true;
+    webgazer.params.saveDataAcrossSessions = false;
+    await webgazer.setRegression('ridge')
+      .setGazeListener(data => { if (data) rawGaze = { x: data.x, y: data.y }; })
+      .begin();
+    webgazer.showPredictionPoints(false);   // 独自に描画する
+    webgazer.showFaceOverlay(false);
+    webgazer.showFaceFeedbackBox(true);
+    setStatus('');
+  }
+
+  function updateGazeTarget() {
+    if (inputMode === 'mouse' || !rawGaze) return;
+    const gx = Math.min(W, Math.max(0, rawGaze.x));
+    const gy = Math.min(H, Math.max(0, rawGaze.y));
+    const k = GAZE_SMOOTH[inputMode];
+    target.x += (gx - target.x) * k;
+    target.y += (gy - target.y) * k;
+  }
+
+  // ---------- Tobii（tobii_bridge.py と WebSocket で通信） ----------
+  // Tobii の座標はモニター全体を 0-1 に正規化したもの。全画面ならページ座標と一致する。
+  // 全画面でない場合はウィンドウ位置から概算する（ブラウザ枠の厚みは推定）。
+  function screenToClient(nx, ny) {
+    if (document.fullscreenElement) return { x: nx * innerWidth, y: ny * innerHeight };
+    const bx = (outerWidth - innerWidth) / 2, top = outerHeight - innerHeight - bx;
+    return { x: nx * screen.width - screenX - bx, y: ny * screen.height - screenY - top };
+  }
+  function clientToScreen(x, y) {
+    if (document.fullscreenElement) return { x: x / innerWidth, y: y / innerHeight };
+    const bx = (outerWidth - innerWidth) / 2, top = outerHeight - innerHeight - bx;
+    return { x: (x + screenX + bx) / screen.width, y: (y + screenY + top) / screen.height };
+  }
+
+  let ws = null, tobiiInfo = null, lastValidGaze = 0;
+  const wsWaiters = [];           // { type, resolve, reject }
+
+  function connectTobii() {
+    return new Promise((resolve, reject) => {
+      if (ws && ws.readyState === WebSocket.OPEN && tobiiInfo) return resolve(tobiiInfo);
+      // ブリッジを --ws-port で別ポート起動した場合は ?ws=<port> を付けて開く
+      ws = new WebSocket(`ws://localhost:${new URLSearchParams(location.search).get('ws') || 8765}`);
+      const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 3000);
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('ブリッジに接続できません')); };
+      ws.onclose = () => {
+        tobiiInfo = null;
+        if (inputMode === 'tobii' && state !== 'title') setStatus('⚠ Tobii ブリッジとの接続が切れました');
+      };
+      ws.onmessage = ev => {
+        const m = JSON.parse(ev.data);
+        if (m.type === 'hello') { clearTimeout(timer); tobiiInfo = m; resolve(m); return; }
+        if (m.type === 'gaze') {
+          if (m.valid) { rawGaze = screenToClient(m.x, m.y); lastValidGaze = performance.now(); }
+          return;
+        }
+        const i = wsWaiters.findIndex(w => w.type === m.type || m.type === 'error');
+        if (i >= 0) {
+          const w = wsWaiters.splice(i, 1)[0];
+          m.type === 'error' ? w.reject(new Error(m.message)) : w.resolve(m);
+        }
+      };
+    });
+  }
+
+  function wsRequest(msg, replyType) {
+    return new Promise((resolve, reject) => {
+      if (replyType) wsWaiters.push({ type: replyType, resolve, reject });
+      ws.send(JSON.stringify(msg));
+      if (!replyType) resolve();
+    });
+  }
+
+  function tobiiPanel(title, msg, buttons) {
+    $('tobiiTitle').textContent = title;
+    $('tobiiMsg').innerHTML = msg;
+    const box = $('tobiiBtns'); box.innerHTML = '';
+    return new Promise(resolve => {
+      buttons.forEach(([label, value, primary]) => {
+        const b = document.createElement('button');
+        b.textContent = label; if (primary) b.className = 'primary';
+        b.onclick = () => { $('tobiiPanel').classList.add('hidden'); resolve(value); };
+        box.appendChild(b);
+      });
+      $('tobiiPanel').classList.remove('hidden');
+    });
+  }
+
+  // 5 点キャリブレーション。点が縮んでいく間に見つめてもらい、縮みきったら Tobii に記録させる
+  let calibDot = null;
+  const CALIB_POINTS = [[0.5, 0.5], [0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]];
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  async function tobiiCalibrate() {
+    state = 'calib';
+    await wsRequest({ type: 'calib_start' });
+    try {
+      for (const [fx, fy] of CALIB_POINTS) {
+        calibDot = { x: fx * W, y: fy * H, t0: performance.now(), dur: 1000 };
+        await wait(1000);
+        const s = clientToScreen(calibDot.x, calibDot.y);
+        await wsRequest({ type: 'calib_point', x: s.x, y: s.y }, 'calib_point_done');
+      }
+      calibDot = null;
+      const res = await wsRequest({ type: 'calib_compute' }, 'calib_result');
+      const errPx = res.error == null ? null : Math.round(res.error * Math.hypot(W, H) / Math.SQRT2);
+      return res.ok
+        ? `キャリブレーション成功（${res.points} 点使用${errPx != null ? `、平均誤差 約 ${errPx} px` : ''}）`
+        : 'キャリブレーションに失敗しました。姿勢を整えてやり直してください。';
+    } catch (e) {
+      calibDot = null;
+      await wsRequest({ type: 'calib_abort' });
+      return 'エラー: ' + e.message;
+    }
+  }
+
+  // 接続確認 → キャリブレーション（任意）→ ゲーム開始
+  async function tobiiSetup(skipConnectMsg) {
+    let msg = skipConnectMsg ? '' :
+      `接続しました：${tobiiInfo.model}（${tobiiInfo.freq} Hz${tobiiInfo.mode === 'mock' ? '、マウスで代用中' : ''}）<br>`;
+    let choice = await tobiiPanel('Tobii', msg +
+      'キャリブレーションでは、画面に順に出る点が縮みきるまで見つめてください。', [
+        ['キャリブレーション開始', 'calib', true], ['スキップ（現在の校正を使う）', 'skip']]);
+    while (choice === 'calib') {
+      const result = await tobiiCalibrate();
+      choice = await tobiiPanel('キャリブレーション', result, [['ゲーム開始', 'play', true], ['やり直す', 'calib']]);
+    }
+    reset();
+  }
+
+  // ---------- 校正 ----------
+  function calibrate() {
+    return new Promise(resolve => {
+      state = 'calib';
+      $('calibMsg').classList.remove('hidden');
+      const fr = [0.08, 0.5, 0.92];
+      const pts = [];
+      let remaining = 9;
+      for (const fy of fr) for (const fx of fr) {
+        const b = document.createElement('button');
+        b.className = 'calib-pt';
+        b.style.left = (fx * 100) + '%'; b.style.top = (fy * 100) + '%';
+        let n = 0;
+        b.addEventListener('click', () => {
+          n++;
+          b.style.background = `rgb(${255 - n * 40}, ${107 + n * 20}, 80)`;
+          if (n >= 5) {
+            b.classList.add('done');
+            if (--remaining === 0) {
+              pts.forEach(p => p.remove());
+              $('calibMsg').classList.add('hidden');
+              resolve();
+            }
+          }
+        });
+        document.body.appendChild(b); pts.push(b);
+      }
+    });
+  }
+
+  // ---------- ゲーム本体 ----------
+  let state = 'title';            // title | calib | countdown | play | over
+  let player = null, obstacles = [], particles = [], elapsed = 0, spawnTimer = 0, countdown = 0, lastT;
+  let best = +(localStorageGet('gazeDodgeBest') || 0);
+  $('best').textContent = 'ベスト: ' + best;
+
+  function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+  function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+  function reset() {
+    player = { x: W / 2, y: H * 0.75, r: 18, trail: [] };
+    target.x = player.x; target.y = player.y;
+    obstacles = []; particles = [];
+    elapsed = 0; spawnTimer = 0; countdown = 3;
+    state = 'countdown';
+    $('hud').classList.remove('hidden');
+    $('over').classList.add('hidden');
+    $('mode').textContent = { tobii: '👁 Tobii', gaze: '📷 Webカメラ', mouse: '🖱 マウス' }[inputMode];
+  }
+
+  // 難易度: 時間とともに出現頻度・速度が上がる
+  function difficulty() { return 1 + elapsed / 25; }
+
+  function spawnObstacle() {
+    const d = difficulty();
+    const kind = Math.random() < Math.min(0.35, elapsed / 120) ? 'bar' : 'rock';
+    if (kind === 'bar') {
+      // 横長のバー（隙間あり）
+      const gap = Math.max(140, 260 - elapsed * 1.5);
+      const gx = 40 + Math.random() * (W - gap - 80);
+      const h = 22, vy = 140 * d;
+      obstacles.push({ type: 'rect', x: 0, y: -h, w: gx, h, vx: 0, vy });
+      obstacles.push({ type: 'rect', x: gx + gap, y: -h, w: W - gx - gap, h, vx: 0, vy });
+    } else {
+      const r = 14 + Math.random() * 26;
+      obstacles.push({
+        type: 'circle', x: Math.random() * W, y: -r, r,
+        vx: (Math.random() - 0.5) * 80 * d, vy: (160 + Math.random() * 140) * d,
+        hue: 0 + Math.random() * 40,
+      });
+    }
+  }
+
+  function hit(o, p) {
+    if (o.type === 'circle') return Math.hypot(o.x - p.x, o.y - p.y) < o.r + p.r * 0.85;
+    const cx = Math.max(o.x, Math.min(p.x, o.x + o.w));
+    const cy = Math.max(o.y, Math.min(p.y, o.y + o.h));
+    return Math.hypot(cx - p.x, cy - p.y) < p.r * 0.85;
+  }
+
+  function explode(x, y) {
+    for (let i = 0; i < 40; i++) {
+      const a = Math.random() * Math.PI * 2, s = 80 + Math.random() * 320;
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1 });
+    }
+  }
+
+  function gameOver() {
+    state = 'over';
+    explode(player.x, player.y);
+    const sc = Math.floor(elapsed * 10);
+    if (sc > best) { best = sc; localStorageSet('gazeDodgeBest', best); }
+    $('best').textContent = 'ベスト: ' + best;
+    $('overScore').textContent = `スコア ${sc}（${elapsed.toFixed(1)} 秒生存）　ベスト ${best}`;
+    setTimeout(() => { if (state === 'over') $('over').classList.remove('hidden'); }, 700);
+  }
+
+  function update(dt) {
+    updateGazeTarget();
+
+    if (state === 'countdown') {
+      countdown -= dt;
+      movePlayer(dt);
+      if (countdown <= 0) state = 'play';
+    } else if (state === 'play') {
+      elapsed += dt;
+      movePlayer(dt);
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) { spawnObstacle(); spawnTimer = Math.max(0.18, 0.9 / difficulty()); }
+      for (const o of obstacles) { o.x += o.vx * dt; o.y += o.vy * dt; }
+      obstacles = obstacles.filter(o => o.y < H + 80);
+      if (obstacles.some(o => hit(o, player))) gameOver();
+      $('score').textContent = 'スコア: ' + Math.floor(elapsed * 10);
+    }
+
+    for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96; p.life -= dt * 1.2; }
+    particles = particles.filter(p => p.life > 0);
+  }
+
+  // プレイヤーは注視点に向かって最大速度付きで追従（視線の飛びで瞬間移動しないように）
+  function movePlayer(dt) {
+    const maxSpeed = { tobii: 1000, gaze: 700, mouse: 1100 }[inputMode];
+    const dx = target.x - player.x, dy = target.y - player.y;
+    const dist = Math.hypot(dx, dy);
+    const step = Math.min(dist, maxSpeed * dt, dist * 10 * dt + 0.5);
+    if (dist > 0.5) { player.x += dx / dist * step; player.y += dy / dist * step; }
+    player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+    player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+    player.trail.push({ x: player.x, y: player.y });
+    if (player.trail.length > 14) player.trail.shift();
+  }
+
+  function draw() {
+    ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+
+    // 背景グリッド（スクロール）
+    ctx.strokeStyle = 'rgba(88,166,255,0.06)'; ctx.lineWidth = 1;
+    const off = (performance.now() / 20) % 40;
+    for (let y = off - 40; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+    for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+
+    if (state === 'calib' && calibDot) {
+      const p = Math.min(1, (performance.now() - calibDot.t0) / calibDot.dur);
+      ctx.fillStyle = '#ff6b6b';
+      ctx.beginPath(); ctx.arc(calibDot.x, calibDot.y, 24 - 16 * p, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(calibDot.x, calibDot.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    if (!player || state === 'title' || state === 'calib') return;
+
+    // 障害物
+    for (const o of obstacles) {
+      if (o.type === 'circle') {
+        ctx.fillStyle = `hsl(${o.hue},85%,60%)`;
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = '#f0883e'; ctx.fillRect(o.x, o.y, o.w, o.h);
+      }
+    }
+
+    // 注視点マーカー
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(target.x, target.y, 10, 0, Math.PI * 2); ctx.stroke();
+
+    // プレイヤー
+    if (state !== 'over') {
+      player.trail.forEach((t, i) => {
+        ctx.fillStyle = `rgba(88,166,255,${i / player.trail.length * 0.3})`;
+        ctx.beginPath(); ctx.arc(t.x, t.y, player.r * i / player.trail.length, 0, Math.PI * 2); ctx.fill();
+      });
+      ctx.fillStyle = '#58a6ff'; ctx.shadowColor = '#58a6ff'; ctx.shadowBlur = 20;
+      ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    for (const p of particles) {
+      ctx.fillStyle = `rgba(88,166,255,${p.life})`;
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+
+    // 瞬きや姿勢の崩れで目が検出できないとき（直前の位置で止まる）
+    if (inputMode === 'tobii' && state !== 'over' && performance.now() - lastValidGaze > 300) {
+      ctx.fillStyle = '#ff6b6b'; ctx.font = 'bold 20px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText('目を検出できません', W / 2, 16);
+    }
+
+    if (state === 'countdown') {
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 96px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(Math.ceil(countdown), W / 2, H / 2);
+      ctx.font = '18px system-ui'; ctx.fillStyle = '#8b949e';
+      ctx.fillText('青い丸を視線で動かせるか確かめてください', W / 2, H / 2 + 80);
+    }
+  }
+
+  function loop(t) {
+    const dt = Math.min(0.05, (t - (lastT || t)) / 1000);
+    lastT = t;
+    update(dt); draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ---------- 画面遷移 ----------
+  $('btnTobii').addEventListener('click', async () => {
+    // 全画面要求はクリック直後（ユーザー操作中）に出す必要がある
+    const fs = document.documentElement.requestFullscreen?.().catch(() => {});
+    $('title').classList.add('hidden');
+    inputMode = 'tobii';
+    try {
+      await connectTobii();
+    } catch (e) {
+      console.error(e);
+      if (document.fullscreenElement) document.exitFullscreen();
+      alert('Tobii ブリッジに接続できませんでした。\n先に「python tobii_bridge.py」を起動してから、http://localhost:8000 で開いてください。');
+      $('title').classList.remove('hidden'); state = 'title';
+      return;
+    }
+    await Promise.race([fs, wait(1000)]);   // 全画面が許可されない環境でも止まらないように
+    await tobiiSetup();
+  });
+  $('btnGaze').addEventListener('click', async () => {
+    $('title').classList.add('hidden');
+    inputMode = 'gaze';
+    try {
+      await startWebGazer();
+    } catch (e) {
+      console.error(e);
+      alert('視線推定を開始できませんでした（カメラ許可・ネット接続を確認してください）。マウスモードで起動します。');
+      inputMode = 'mouse';
+      reset(); return;
+    }
+    await calibrate();
+    reset();
+  });
+  $('btnMouse').addEventListener('click', () => { $('title').classList.add('hidden'); inputMode = 'mouse'; reset(); });
+  $('btnRetry').addEventListener('click', reset);
+  $('btnRecalib').addEventListener('click', async () => {
+    $('over').classList.add('hidden'); $('hud').classList.add('hidden');
+    if (inputMode === 'tobii') return tobiiSetup(true);
+    if (inputMode === 'gaze') { webgazer.clearData(); await calibrate(); }
+    reset();
+  });
+  $('btnMenu').addEventListener('click', () => {
+    $('over').classList.add('hidden'); $('hud').classList.add('hidden');
+    $('title').classList.remove('hidden'); state = 'title';
+  });
+  addEventListener('keydown', e => { if (e.code === 'Space' && state === 'over') { e.preventDefault(); reset(); } });
+})();
+</script>
+</body>
+</html>
