@@ -1,1 +1,4 @@
 data/
+# 障害物の画像と設定は GitHub に載せない（使い方の README だけ残す）
+obstacles/*
+!obstacles/README.md

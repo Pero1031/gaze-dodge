@@ -111,6 +111,18 @@
   </div>
 </div>
 
+<!-- 本人確認（目の間隔が近い、過去にプレイした登録者がいるとき） -->
+<div id="confirmPlayer" class="overlay hidden">
+  <div class="panel">
+    <h1 id="confirmName"></h1>
+    <p id="confirmMsg"></p>
+    <div>
+      <button id="btnConfirmYes" class="primary dwell">はい</button>
+      <button id="btnConfirmNo" class="dwell">いいえ（一覧から選ぶ）</button>
+    </div>
+  </div>
+</div>
+
 <!-- 新規登録（名前入力はキーボード） -->
 <div id="register" class="overlay hidden">
   <div class="panel">
@@ -549,11 +561,31 @@
       measuredIpd = await measureIpd(1.5);
       players = (await wsRequest({ type: 'players_get' }, 'players')).players;
       renderPlayerList();
+      const cand = likelyReturningPlayer();
+      if (cand) askIfSamePlayer(cand);
     } catch (e) {
       $('selectMsg').textContent = 'エラー: ' + e.message;
     }
     currentPlayer = await picked;
-    hide('select'); hide('register');
+    hide('select'); hide('register'); hide('confirmPlayer');
+  }
+
+  // 過去にプレイしたことがあり、目の間隔の差が IPD_MATCH_MM 以内の登録者のうち一番近い人（いなければ null）
+  function likelyReturningPlayer() {
+    if (measuredIpd == null) return null;
+    const near = players.filter(p => p.plays > 0 && p.ipd != null && Math.abs(p.ipd - measuredIpd) <= IPD_MATCH_MM)
+      .sort((a, b) => Math.abs(a.ipd - measuredIpd) - Math.abs(b.ipd - measuredIpd));
+    return near[0] || null;
+  }
+
+  // 一覧の前に「○○さんですか？」と聞く。はい → その人で開始、いいえ → 一覧から選ぶ
+  function askIfSamePlayer(p) {
+    $('confirmName').textContent = `${p.name}さんですか？`;
+    $('confirmMsg').textContent = `目の間隔が近い登録者です（差 ${Math.abs(p.ipd - measuredIpd).toFixed(1)} mm・自己ベスト ${p.best}）。` +
+      (inputMode === 'mouse' ? '' : 'ボタンを 1 秒見つめても選べます。');
+    $('btnConfirmYes').onclick = () => selectResolve(p);
+    $('btnConfirmNo').onclick = () => { hide('confirmPlayer'); show('select'); };
+    hide('select'); show('confirmPlayer');
   }
 
   function renderPlayerList() {
@@ -674,8 +706,9 @@
   }
 
   // ---------- 画像の障害物（obstacles/obstacles.json） ----------
-  // 岩の一部を画像に置き換える。設定や画像がなければ今までどおり岩だけ
-  let imageObstacles = { probability: 0, images: [] };   // images: [{ file, img, size:[min,max], weight, hitbox, spin, aspect, mask }]
+  // 障害物を 1 つ出すたびに、各画像を probability の確率で選ぶ（全障害物のうちの割合）。
+  // 選ばれなければ今までどおり岩か横バー。設定や画像がなければ画像の障害物は出ない
+  let imageObstacles = { images: [] };   // images: [{ file, img, probability, size:[min,max], hitbox, spin, aspect, mask, fallSpeed, homingSpeed }]
   const MASK_MAX = 128;            // 形どおりの当たり判定に使う透明度マップの解像度（長辺 px）
 
   async function loadImageObstacles() {
@@ -686,7 +719,10 @@
       const cfg = await res.json();
       const defs = cfg.images || [];
       const loaded = (await Promise.all(defs.map(loadObstacleImage))).filter(Boolean);
-      imageObstacles = { probability: Math.min(1, Math.max(0, +cfg.probability || 0)), images: loaded };
+      // 確率の合計が 1 を超えていたら、比率を保って合計 1 に縮める
+      const sum = loaded.reduce((s, im) => s + im.probability, 0);
+      if (sum > 1) loaded.forEach(im => { im.probability /= sum; });
+      imageObstacles = { images: loaded };
       const failed = defs.length - loaded.length;
       if (failed) setStatus(`⚠ 障害物の画像 ${failed} 個を読み込めませんでした（ファイル名を確認してください。詳細はコンソール）`);
     } catch (e) {
@@ -701,8 +737,12 @@
         const nw = img.naturalWidth || 100, nh = img.naturalHeight || 100;
         const sz = Array.isArray(def.size) ? def.size : [def.size ?? 80, def.size ?? 80];
         const hitbox = ['alpha', 'circle', 'box'].includes(def.hitbox) ? def.hitbox : 'alpha';
-        resolve({ file: def.file, img, size: [+sz[0], +(sz[1] ?? sz[0])], weight: Math.max(0, def.weight ?? 1),
-                  hitbox, spin: !!def.spin, aspect: nh / nw, mask: hitbox === 'alpha' ? buildAlphaMask(img, nw, nh) : null });
+        const range = v => v == null ? null : Array.isArray(v) ? [+v[0], +(v[1] ?? v[0])] : [+v, +v];
+        resolve({ file: def.file, img, probability: Math.min(1, Math.max(0, +def.probability || 0)),
+                  size: [+sz[0], +(sz[1] ?? sz[0])], hitbox, spin: !!def.spin, aspect: nh / nw,
+                  mask: hitbox === 'alpha' ? buildAlphaMask(img, nw, nh) : null,
+                  fallSpeed: range(def.fall_speed),              // 落ちる速さ [px/s]（省略時は岩と同じ）
+                  homingSpeed: Math.max(0, +def.homing_speed || 0) });   // プレイヤーへ横に寄る最大速さ [px/s]（0 で寄らない）
       };
       img.onerror = () => { console.warn('障害物の画像を読み込めません:', def.file); resolve(null); };
       img.src = 'obstacles/' + encodeURIComponent(def.file);
@@ -720,17 +760,16 @@
     return { w, h, a };
   }
 
+  // 各画像を probability の確率で選ぶ。どれも選ばれなければ null（岩か横バーになる）
   function pickObstacleImage() {
-    const list = imageObstacles.images, total = list.reduce((s, im) => s + im.weight, 0);
-    if (!total) return null;
-    let r = Math.random() * total;
-    return list.find(im => (r -= im.weight) < 0) || list[list.length - 1];
+    let r = Math.random();
+    return imageObstacles.images.find(im => (r -= im.probability) < 0) || null;
   }
 
   function spawnObstacle() {
     const d = difficulty();
-    const kind = Math.random() < Math.min(0.35, elapsed / 120) ? 'bar' : 'rock';
-    const im = kind === 'rock' && Math.random() < imageObstacles.probability ? pickObstacleImage() : null;
+    const im = pickObstacleImage();
+    const kind = im ? 'image' : Math.random() < Math.min(0.35, elapsed / 120) ? 'bar' : 'rock';
     if (kind === 'bar') {
       // 横長のバー（隙間あり）
       const gap = barGap();
@@ -738,12 +777,14 @@
       const h = 22, vy = 140 * d;
       obstacles.push({ type: 'rect', x: 0, y: -h, w: gx, h, vx: 0, vy });
       obstacles.push({ type: 'rect', x: gx + gap, y: -h, w: W - gx - gap, h, vx: 0, vy });
-    } else if (im) {
-      // 画像の障害物（x, y は中心）。動き方は岩と同じ
+    } else if (kind === 'image') {
+      // 画像の障害物（x, y は中心）。fall_speed があればその速さで落ち、homing_speed があればプレイヤーに横から寄っていく
       const w = im.size[0] + Math.random() * (im.size[1] - im.size[0]), h = w * im.aspect;
+      const fall = im.fallSpeed ? im.fallSpeed[0] + Math.random() * (im.fallSpeed[1] - im.fallSpeed[0]) : 160 + Math.random() * 140;
       obstacles.push({
         type: 'image', im, x: Math.random() * W, y: -Math.max(w, h) / 2, w, h,
-        vx: (Math.random() - 0.5) * 80 * d, vy: (160 + Math.random() * 140) * d,
+        vx: im.homingSpeed ? 0 : (Math.random() - 0.5) * 80 * d, vy: fall * d,
+        homing: im.homingSpeed * d,
         rot: im.spin ? Math.random() * Math.PI * 2 : 0, vr: im.spin ? (Math.random() - 0.5) * 3 : 0,
       });
     } else {
@@ -762,6 +803,17 @@
     const cx = Math.max(o.x, Math.min(p.x, o.x + o.w));
     const cy = Math.max(o.y, Math.min(p.y, o.y + o.h));
     return Math.hypot(cx - p.x, cy - p.y) < p.r * 0.85;
+  }
+
+  // プレイヤーにゆっくり寄っていく障害物。縦は常に下向き（vy は変えない）で、横の速さだけを
+  // プレイヤーの方向へ少しずつ変える（最大 o.homing px/s、急に曲がらないよう HOMING_TURN [1/s] でなめらかに）。
+  // プレイヤーより下に来たら追うのをやめ、そのまま下へ消える
+  const HOMING_TURN = 1.5;
+  function steerToPlayer(o, dt) {
+    if (!player || o.y > player.y) return;
+    const dx = player.x - o.x;
+    const want = Math.sign(dx) * Math.min(Math.abs(dx) * 1.2, o.homing);   // 近いほどゆっくり（行き過ぎない）
+    o.vx += (want - o.vx) * Math.min(1, HOMING_TURN * dt);
   }
 
   function hitImage(o, p) {
@@ -839,7 +891,10 @@
       movePlayer(dt);
       spawnTimer -= dt;
       if (spawnTimer <= 0) { spawnObstacle(); spawnTimer = Math.max(0.18, 0.9 / difficulty()); }
-      for (const o of obstacles) { o.x += o.vx * dt; o.y += o.vy * dt; if (o.vr) o.rot += o.vr * dt; }
+      for (const o of obstacles) {
+        if (o.homing) steerToPlayer(o, dt);
+        o.x += o.vx * dt; o.y += o.vy * dt; if (o.vr) o.rot += o.vr * dt;
+      }
       obstacles = obstacles.filter(o => (o.type === 'image' ? o.y - Math.max(o.w, o.h) / 2 : o.y) < H + 80);
       if (obstacles.some(o => hit(o, player))) gameOver();
       $('score').textContent = 'スコア: ' + Math.floor(elapsed * 10);
@@ -1040,8 +1095,15 @@
   // 動作確認用：?debug を付けて開くと、コンソールから gazeDebug() で内部の状態を見られる
   if (new URLSearchParams(location.search).has('debug')) {
     window.gazeDebug = () => ({ state, target: { ...target }, rawGaze, player: player && { x: player.x, y: player.y },
-      imageObstacles: imageObstacles.images.map(im => ({ file: im.file, size: im.size, hitbox: im.hitbox, mask: im.mask && [im.mask.w, im.mask.h] })),
-      onScreen: obstacles.map(o => o.type) });
+      imageObstacles: imageObstacles.images.map(im => ({ file: im.file, probability: im.probability, size: im.size, hitbox: im.hitbox,
+        fallSpeed: im.fallSpeed, homingSpeed: im.homingSpeed, mask: im.mask && [im.mask.w, im.mask.h] })),
+      onScreen: obstacles.map(o => o.type),
+      images: obstacles.filter(o => o.type === 'image').map(o => ({ x: o.x, y: o.y, vx: o.vx, vy: o.vy })) });
+    window.gazeDebugSpawnStats = n => {   // spawnObstacle を n 回試したときの種類の割合（実際には出さない）
+      const saved = obstacles; obstacles = []; const c = {};
+      for (let i = 0; i < n; i++) { const k = obstacles.length; spawnObstacle(); const t = obstacles[k].type; c[t] = (c[t] || 0) + 1; }
+      obstacles = saved; return c;
+    };
     // 当たり判定を直接試す：1 つ目の画像を幅 100px・中心 (0,0)・回転 rot で置き、プレイヤー中心 (px, py) で当たるか
     window.gazeDebugHitImage = (px, py, rot = 0) => {
       const im = imageObstacles.images[0];
