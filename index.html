@@ -41,6 +41,8 @@
   table.rank th { padding:4px 12px; font-size:13px; font-weight:400; color:var(--muted); border-bottom:1px solid #30363d; }
   #rankingTable tbody tr:nth-child(1) td:nth-child(2) { color:var(--gold); font-weight:700; }
   #rankingTable td:nth-child(4) { color:var(--muted); font-size:14px; }
+  .panel p.notice { color:var(--fg); background:rgba(227,179,65,.12); border:1px solid rgba(227,179,65,.5);
+    border-radius:8px; padding:10px 14px; }
   .hidden { display:none !important; }
   /* カウントダウン中・プレイ中はマウスカーソルを消す（視線のじゃまにならないように） */
   body.playing, body.playing * { cursor:none !important; }
@@ -68,6 +70,8 @@
   <div class="panel">
     <h1>👁 Gaze Dodge</h1>
     <p>視線でプレイヤー（青い丸）を動かし、上から降ってくる障害物を避け続けるゲームです。</p>
+    <p class="notice">🙆 <b>プレイ中は、できるだけ頭を動かさず固定してください。</b><br>
+      画面から 60 cm ほど離れて座り、楽な姿勢で目だけを動かすと、視線を正確に読み取れます。</p>
     <p><b style="color:var(--fg)">Tobii モード</b>：先に <code>python tobii_bridge.py</code> を起動しておいてください。全画面で遊びます。<br>
       <b style="color:var(--fg)">Webカメラモード</b>：<a href="https://webgazer.cs.brown.edu/" style="color:var(--accent)">WebGazer.js</a> で視線を推定します。</p>
     <div>
@@ -178,7 +182,7 @@
       <button id="btnRecalib" class="dwell">再校正</button>
       <button id="btnMenu" class="dwell">タイトルへ</button>
     </div>
-    <p style="font-size:13px">ボタンは 1 秒見つめても押せます。Space キーでも再スタート</p>
+    <p style="font-size:13px"><span id="overDwellHint">ボタンは 1 秒見つめても押せます。</span>Space キーでも再スタート</p>
   </div>
 </div>
 
@@ -267,13 +271,16 @@
   }
 
   // ---------- 見つめて押すボタン（dwell） ----------
-  // 表示中の button.dwell を注視点が DWELL_SEC 秒見続けたらクリックする
+  // 表示中の button.dwell を注視点が DWELL_SEC 秒見続けたらクリックする。
+  // 今は使わない設定（DWELL_ENABLED = false）。ボタンはマウスでクリックして選ぶ。true にすると元に戻る
+  const DWELL_ENABLED = false;
   const DWELL_SEC = 1.0;
   let dwellEl = null, dwellT = 0;
+  const dwellOn = () => DWELL_ENABLED && inputMode && inputMode !== 'mouse';   // 見つめて選べる状態か
 
   function updateDwell(dt) {
     const btns = [...document.querySelectorAll('button.dwell')].filter(b => b.offsetParent !== null);
-    const active = inputMode && inputMode !== 'mouse' && btns.length > 0;
+    const active = dwellOn() && btns.length > 0;
     $('gazeCursor').classList.toggle('hidden', !active);
     if (!active) { setDwell(null); return; }
     $('gazeCursor').style.left = target.x + 'px'; $('gazeCursor').style.top = target.y + 'px';
@@ -484,6 +491,7 @@
     const msg = skipConnectMsg ? '' :
       `接続しました：${bridgeInfo.model}（${bridgeInfo.freq} Hz${bridgeInfo.mode === 'mock' ? '、マウスで代用中' : ''}）<br>`;
     const first = await tobiiPanel('Tobii', msg +
+      '<b style="color:var(--fg)">頭をできるだけ動かさず固定し、目だけで点を追ってください。</b><br>' +
       'キャリブレーションでは、画面に順に出る<b style="color:var(--danger)">赤い点</b>が縮みきるまで見つめてください。<br>' +
       '続けて<b style="color:var(--ok)">緑の点</b>で精度を確かめます。', [
         ['キャリブレーション開始', 'calib', true], ['スキップ（現在の校正を使う）', 'skip']]);
@@ -501,7 +509,7 @@
       }
       if (attempt < CALIB_MAX_ATTEMPTS) {
         await tobiiNotice('精度が基準に届きませんでした', detail +
-          `<br><br>姿勢を整えて、もう一度行います（${attempt + 1} / ${CALIB_MAX_ATTEMPTS} 回目）`, 3500);
+          `<br><br>頭の位置を整えて固定し、もう一度行います（${attempt + 1} / ${CALIB_MAX_ATTEMPTS} 回目）`, 3500);
         continue;
       }
       const c = await tobiiPanel('精度が基準に届きません', detail +
@@ -543,7 +551,7 @@
   }
 
   // ---------- プレイヤー（登録・選択） ----------
-  // 本人確認は「両目の間隔（瞳孔間距離）が近い人を上に並べる」だけにとどめ、最後は本人が名前を見つめて選ぶ。
+  // 本人確認は「両目の間隔（瞳孔間距離）が近い人を上に並べる」だけにとどめ、最後は本人が名前を選ぶ。
   // 両目の間隔は人によって数 mm しか違わないため、自動で決め打ちはしない。
   const IPD_MATCH_MM = 2.0;       // この差以内なら「候補」として強調する
   let currentPlayer = null;       // null = ゲスト
@@ -591,7 +599,7 @@
   function askIfSamePlayer(p) {
     $('confirmName').textContent = `${p.name}さんですか？`;
     $('confirmMsg').textContent = `目の間隔が近い登録者です（差 ${Math.abs(p.ipd - measuredIpd).toFixed(1)} mm・自己ベスト ${p.best}）。` +
-      (inputMode === 'mouse' ? '' : 'ボタンを 1 秒見つめても選べます。');
+      (dwellOn() ? 'ボタンを 1 秒見つめても選べます。' : '');
     $('btnConfirmYes').onclick = () => selectResolve(p);
     $('btnConfirmNo').onclick = () => { hide('confirmPlayer'); show('select'); };
     hide('select'); show('confirmPlayer');
@@ -600,7 +608,7 @@
   function renderPlayerList() {
     const list = players.map(p => ({ ...p, diff: (measuredIpd != null && p.ipd != null) ? Math.abs(p.ipd - measuredIpd) : null }));
     if (measuredIpd != null) list.sort((a, b) => (a.diff ?? 99) - (b.diff ?? 99));
-    const how = inputMode === 'mouse' ? 'クリックして選んでください。' : '自分の名前を 1 秒見つめると選べます。';
+    const how = dwellOn() ? '自分の名前を 1 秒見つめると選べます。' : '自分の名前をクリックして選んでください。';
     $('selectMsg').textContent = (players.length ? how : 'まだ登録がありません。「新規登録」から登録してください。') +
       (measuredIpd != null ? `（あなたの目の間隔：${measuredIpd.toFixed(1)} mm）` : '');
     const box = $('plist'); box.innerHTML = '';
@@ -883,6 +891,7 @@
     $('btnSwitch').classList.toggle('hidden', !bridgeOK());
     $('btnRecalib').classList.toggle('hidden', inputMode === 'mouse');
     await shown;
+    $('overDwellHint').classList.toggle('hidden', !dwellOn());
     if (state === 'over') show('over');
   }
 
@@ -998,7 +1007,7 @@
       ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 96px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(Math.ceil(countdown), W / 2, H / 2);
       ctx.font = '18px system-ui'; ctx.fillStyle = '#8b949e';
-      ctx.fillText('青い丸を視線で動かせるか確かめてください', W / 2, H / 2 + 80);
+      ctx.fillText('頭を動かさず、目だけで青い丸を動かしてください', W / 2, H / 2 + 80);
     }
   }
 
