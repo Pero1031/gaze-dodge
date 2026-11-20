@@ -3,6 +3,8 @@
 視線でプレイヤーを動かし、降ってくる障害物を避けるブラウザゲームです。
 入力は **Tobii Pro アイトラッカー**（推奨）、Webカメラ（[WebGazer.js](https://webgazer.cs.brown.edu/)）、マウス（テスト用）から選べます。
 
+Unity に移植した版が `unity/` にあります（入力は Tobii とマウス。同じブリッジを使う）。使い方は [unity/README.md](unity/README.md)。
+
 ## Tobii で遊ぶ
 
 ブラウザは Tobii に直接アクセスできないため、`tobii_bridge.py` が Tobii Pro SDK（`tobii_research`）で視線を取得し、
